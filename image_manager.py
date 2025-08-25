@@ -64,7 +64,8 @@ class ImageManager:
         
         # 配置相关变量
         self.config_file = "config.json"
-        self.target_directories = {}  # {名称: 路径}
+        self.target_directories = {}  # 兼容旧格式 {名称: 路径}
+        self.scenarios = {}  # 新格式 {场景名称: {子目录名称: 路径}}
         self.selected_target = tk.StringVar()
         
         # 加载配置
@@ -98,19 +99,49 @@ class ImageManager:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     self.target_directories = config.get('target_directories', {})
+                    self.scenarios = config.get('scenarios', {})
+                    
+                    # 如果有旧格式的target_directories，转换为新格式
+                    if self.target_directories and not self.scenarios:
+                        self.scenarios = {}
+                        for name, path in self.target_directories.items():
+                            # 从路径中提取场景名和子目录名
+                            path_parts = path.replace('/', '\\').split('\\')
+                            if len(path_parts) >= 2:
+                                # 倒数第二级作为场景名，最后一级作为子目录名
+                                scenario_name = path_parts[-2]
+                                subdir_name = path_parts[-1]
+                            else:
+                                # 如果路径层级不够，使用原名称作为子目录，场景名为默认
+                                scenario_name = '默认场景'
+                                subdir_name = name
+                            
+                            # 确保场景存在
+                            if scenario_name not in self.scenarios:
+                                self.scenarios[scenario_name] = {}
+                            
+                            # 添加子目录
+                            self.scenarios[scenario_name][subdir_name] = path
+                        
+                        self.target_directories = {}  # 清空旧格式
+                    
                     # 设置默认选中的目标目录
-                    if self.target_directories:
-                        first_key = list(self.target_directories.keys())[0]
-                        self.selected_target.set(first_key)
+                    if self.scenarios:
+                        first_scenario = list(self.scenarios.keys())[0]
+                        if self.scenarios[first_scenario]:
+                            first_subdir = list(self.scenarios[first_scenario].keys())[0]
+                            self.selected_target.set(f"{first_scenario}::{first_subdir}")
         except Exception as e:
             print(f"加载配置文件失败: {e}")
             self.target_directories = {}
+            self.scenarios = {}
     
     def save_config(self):
         """保存配置文件"""
         try:
             config = {
-                'target_directories': self.target_directories
+                'target_directories': self.target_directories,  # 保持兼容性
+                'scenarios': self.scenarios
             }
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
@@ -118,34 +149,36 @@ class ImageManager:
             messagebox.showerror("错误", f"保存配置文件失败: {e}")
     
     def open_target_config(self):
-        """打开目标目录配置对话框"""
+        """打开场景和子目录配置对话框"""
         config_window = tk.Toplevel(self.root)
-        config_window.title("目标目录配置")
-        config_window.geometry("600x400")
+        config_window.title("场景和子目录配置")
+        config_window.geometry("700x500")
         config_window.resizable(True, True)
         config_window.transient(self.root)
         config_window.grab_set()
         
         # 居中显示对话框
         config_window.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (600 // 2)
-        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (400 // 2)
-        config_window.geometry(f"600x400+{x}+{y}")
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (700 // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (500 // 2)
+        config_window.geometry(f"700x500+{x}+{y}")
         
         # 主框架
         main_frame = ttk.Frame(config_window, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # 目录列表框架
-        list_frame = ttk.LabelFrame(main_frame, text="目标目录列表", padding="5")
+        # 场景和子目录列表框架
+        list_frame = ttk.LabelFrame(main_frame, text="场景和子目录列表", padding="5")
         list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        # 创建Treeview来显示目录
-        columns = ('name', 'path')
-        tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=10)
-        tree.heading('name', text='名称')
+        # 创建Treeview来显示场景和子目录的层级结构
+        tree = ttk.Treeview(list_frame, show='tree headings', height=12)
+        tree.heading('#0', text='场景/子目录')
+        tree.column('#0', width=250)
+        
+        # 添加路径列
+        tree['columns'] = ('path',)
         tree.heading('path', text='路径')
-        tree.column('name', width=150)
         tree.column('path', width=400)
         
         # 滚动条
@@ -155,12 +188,19 @@ class ImageManager:
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_tree.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # 刷新目录列表
+        # 刷新树形列表
         def refresh_tree():
             for item in tree.get_children():
                 tree.delete(item)
-            for name, path in self.target_directories.items():
-                tree.insert('', tk.END, values=(name, path))
+            for scenario_name, subdirs in self.scenarios.items():
+                scenario_item = tree.insert('', tk.END, text=scenario_name, values=('',), tags=('scenario',))
+                for subdir_name, subdir_path in subdirs.items():
+                    tree.insert(scenario_item, tk.END, text=subdir_name, values=(subdir_path,), tags=('subdir',))
+                tree.item(scenario_item, open=True)  # 展开场景节点
+        
+        # 配置标签样式
+        tree.tag_configure('scenario', background='#e6f3ff')
+        tree.tag_configure('subdir', background='#f0f0f0')
         
         refresh_tree()
         
@@ -168,24 +208,83 @@ class ImageManager:
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X)
         
-        # 添加目录
-        def add_directory():
+        # 添加场景
+        def add_scenario():
             add_window = tk.Toplevel(config_window)
-            add_window.title("添加目标目录")
-            add_window.geometry("400x150")
+            add_window.title("添加场景")
+            add_window.geometry("350x120")
             add_window.transient(config_window)
             add_window.grab_set()
             
             # 居中显示对话框
             add_window.update_idletasks()
-            x = config_window.winfo_x() + (config_window.winfo_width() // 2) - (400 // 2)
-            y = config_window.winfo_y() + (config_window.winfo_height() // 2) - (150 // 2)
-            add_window.geometry(f"400x150+{x}+{y}")
+            x = config_window.winfo_x() + (config_window.winfo_width() // 2) - (350 // 2)
+            y = config_window.winfo_y() + (config_window.winfo_height() // 2) - (120 // 2)
+            add_window.geometry(f"350x120+{x}+{y}")
             
             frame = ttk.Frame(add_window, padding="10")
             frame.pack(fill=tk.BOTH, expand=True)
             
-            ttk.Label(frame, text="名称:").grid(row=0, column=0, sticky=tk.W, pady=5)
+            ttk.Label(frame, text="场景名称:").grid(row=0, column=0, sticky=tk.W, pady=5)
+            name_var = tk.StringVar()
+            ttk.Entry(frame, textvariable=name_var, width=25).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+            
+            def save_scenario():
+                name = name_var.get().strip()
+                if not name:
+                    messagebox.showwarning("警告", "请填写场景名称")
+                    return
+                if name in self.scenarios:
+                    messagebox.showwarning("警告", "该场景名称已存在")
+                    return
+                
+                self.scenarios[name] = {}
+                self.save_config()
+                refresh_tree()
+                self.update_target_checkboxes()
+                add_window.destroy()
+            
+            button_frame_add = ttk.Frame(frame)
+            button_frame_add.grid(row=1, column=0, columnspan=2, pady=10)
+            ttk.Button(button_frame_add, text="保存", command=save_scenario).pack(side=tk.LEFT, padx=5)
+            ttk.Button(button_frame_add, text="取消", command=add_window.destroy).pack(side=tk.LEFT, padx=5)
+            
+            frame.columnconfigure(1, weight=1)
+        
+        # 添加子目录
+        def add_subdir():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning("警告", "请先选择一个场景")
+                return
+            
+            item = tree.item(selection[0])
+            # 判断选中的是场景还是子目录
+            if 'scenario' in tree.item(selection[0], 'tags'):
+                scenario_name = item['text']
+            elif 'subdir' in tree.item(selection[0], 'tags'):
+                parent_item = tree.parent(selection[0])
+                scenario_name = tree.item(parent_item)['text']
+            else:
+                messagebox.showwarning("警告", "请选择一个场景")
+                return
+            
+            add_window = tk.Toplevel(config_window)
+            add_window.title(f"为场景 '{scenario_name}' 添加子目录")
+            add_window.geometry("450x150")
+            add_window.transient(config_window)
+            add_window.grab_set()
+            
+            # 居中显示对话框
+            add_window.update_idletasks()
+            x = config_window.winfo_x() + (config_window.winfo_width() // 2) - (450 // 2)
+            y = config_window.winfo_y() + (config_window.winfo_height() // 2) - (150 // 2)
+            add_window.geometry(f"450x150+{x}+{y}")
+            
+            frame = ttk.Frame(add_window, padding="10")
+            frame.pack(fill=tk.BOTH, expand=True)
+            
+            ttk.Label(frame, text="子目录名称:").grid(row=0, column=0, sticky=tk.W, pady=5)
             name_var = tk.StringVar()
             ttk.Entry(frame, textvariable=name_var, width=30).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
             
@@ -201,125 +300,185 @@ class ImageManager:
             
             ttk.Button(frame, text="浏览", command=browse_path).grid(row=1, column=2, padx=5, pady=5)
             
-            def save_directory():
+            def save_subdir():
                 name = name_var.get().strip()
                 path = path_var.get().strip()
                 if not name or not path:
                     messagebox.showwarning("警告", "请填写完整的名称和路径")
                     return
-                if name in self.target_directories:
-                    messagebox.showwarning("警告", "该名称已存在")
+                if name in self.scenarios[scenario_name]:
+                    messagebox.showwarning("警告", "该子目录名称在此场景中已存在")
                     return
                 if not os.path.exists(path):
                     messagebox.showwarning("警告", "路径不存在")
                     return
                 
-                self.target_directories[name] = path
+                self.scenarios[scenario_name][name] = path
                 self.save_config()
                 refresh_tree()
-                # 更新主界面的复选框列表
                 self.update_target_checkboxes()
                 add_window.destroy()
             
             button_frame_add = ttk.Frame(frame)
             button_frame_add.grid(row=2, column=0, columnspan=3, pady=10)
-            ttk.Button(button_frame_add, text="保存", command=save_directory).pack(side=tk.LEFT, padx=5)
+            ttk.Button(button_frame_add, text="保存", command=save_subdir).pack(side=tk.LEFT, padx=5)
             ttk.Button(button_frame_add, text="取消", command=add_window.destroy).pack(side=tk.LEFT, padx=5)
             
             frame.columnconfigure(1, weight=1)
         
-        # 删除目录
-        def delete_directory():
+        # 删除功能
+        def delete_item():
             selection = tree.selection()
             if not selection:
-                messagebox.showwarning("警告", "请选择要删除的目录")
+                messagebox.showwarning("警告", "请选择要删除的项目")
                 return
             
             item = tree.item(selection[0])
-            name = item['values'][0]
-            
-            if messagebox.askyesno("确认", f"确定要删除目录 '{name}' 吗？"):
-                del self.target_directories[name]
-                self.save_config()
-                refresh_tree()
-                # 更新复选框
-                self.update_target_checkboxes()
+            if 'scenario' in tree.item(selection[0], 'tags'):
+                # 删除场景
+                scenario_name = item['text']
+                if messagebox.askyesno("确认", f"确定要删除场景 '{scenario_name}' 及其所有子目录吗？"):
+                    del self.scenarios[scenario_name]
+                    self.save_config()
+                    refresh_tree()
+                    self.update_target_checkboxes()
+            elif 'subdir' in tree.item(selection[0], 'tags'):
+                # 删除子目录
+                subdir_name = item['text']
+                parent_item = tree.parent(selection[0])
+                scenario_name = tree.item(parent_item)['text']
+                if messagebox.askyesno("确认", f"确定要删除子目录 '{subdir_name}' 吗？"):
+                    del self.scenarios[scenario_name][subdir_name]
+                    self.save_config()
+                    refresh_tree()
+                    self.update_target_checkboxes()
         
-        # 编辑目录
-        def edit_directory():
+        # 编辑功能
+        def edit_item():
             selection = tree.selection()
             if not selection:
-                messagebox.showwarning("警告", "请选择要编辑的目录")
+                messagebox.showwarning("警告", "请选择要编辑的项目")
                 return
             
             item = tree.item(selection[0])
-            old_name = item['values'][0]
-            old_path = item['values'][1]
-            
-            edit_window = tk.Toplevel(config_window)
-            edit_window.title("编辑目标目录")
-            edit_window.geometry("400x150")
-            edit_window.transient(config_window)
-            edit_window.grab_set()
-            
-            # 居中显示对话框
-            edit_window.update_idletasks()
-            x = config_window.winfo_x() + (config_window.winfo_width() // 2) - (400 // 2)
-            y = config_window.winfo_y() + (config_window.winfo_height() // 2) - (150 // 2)
-            edit_window.geometry(f"400x150+{x}+{y}")
-            
-            frame = ttk.Frame(edit_window, padding="10")
-            frame.pack(fill=tk.BOTH, expand=True)
-            
-            ttk.Label(frame, text="名称:").grid(row=0, column=0, sticky=tk.W, pady=5)
-            name_var = tk.StringVar(value=old_name)
-            ttk.Entry(frame, textvariable=name_var, width=30).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
-            
-            ttk.Label(frame, text="路径:").grid(row=1, column=0, sticky=tk.W, pady=5)
-            path_var = tk.StringVar(value=old_path)
-            path_entry = ttk.Entry(frame, textvariable=path_var, width=30)
-            path_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
-            
-            def browse_path():
-                directory = filedialog.askdirectory(title="选择目标目录")
-                if directory:
-                    path_var.set(directory)
-            
-            ttk.Button(frame, text="浏览", command=browse_path).grid(row=1, column=2, padx=5, pady=5)
-            
-            def save_directory():
-                name = name_var.get().strip()
-                path = path_var.get().strip()
-                if not name or not path:
-                    messagebox.showwarning("警告", "请填写完整的名称和路径")
-                    return
-                if name != old_name and name in self.target_directories:
-                    messagebox.showwarning("警告", "该名称已存在")
-                    return
-                if not os.path.exists(path):
-                    messagebox.showwarning("警告", "路径不存在")
-                    return
+            if 'scenario' in tree.item(selection[0], 'tags'):
+                # 编辑场景名称
+                old_name = item['text']
                 
-                # 删除旧的，添加新的
-                if old_name in self.target_directories:
-                    del self.target_directories[old_name]
-                self.target_directories[name] = path
-                self.save_config()
-                refresh_tree()
-                # 更新复选框
-                self.update_target_checkboxes()
-                edit_window.destroy()
-            
-            button_frame_edit = ttk.Frame(frame)
-            button_frame_edit.grid(row=2, column=0, columnspan=3, pady=10)
-            ttk.Button(button_frame_edit, text="保存", command=save_directory).pack(side=tk.LEFT, padx=5)
-            ttk.Button(button_frame_edit, text="取消", command=edit_window.destroy).pack(side=tk.LEFT, padx=5)
-            
-            frame.columnconfigure(1, weight=1)
+                edit_window = tk.Toplevel(config_window)
+                edit_window.title("编辑场景名称")
+                edit_window.geometry("350x120")
+                edit_window.transient(config_window)
+                edit_window.grab_set()
+                
+                # 居中显示对话框
+                edit_window.update_idletasks()
+                x = config_window.winfo_x() + (config_window.winfo_width() // 2) - (350 // 2)
+                y = config_window.winfo_y() + (config_window.winfo_height() // 2) - (120 // 2)
+                edit_window.geometry(f"350x120+{x}+{y}")
+                
+                frame = ttk.Frame(edit_window, padding="10")
+                frame.pack(fill=tk.BOTH, expand=True)
+                
+                ttk.Label(frame, text="场景名称:").grid(row=0, column=0, sticky=tk.W, pady=5)
+                name_var = tk.StringVar(value=old_name)
+                ttk.Entry(frame, textvariable=name_var, width=25).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+                
+                def save_scenario():
+                    name = name_var.get().strip()
+                    if not name:
+                        messagebox.showwarning("警告", "请填写场景名称")
+                        return
+                    if name != old_name and name in self.scenarios:
+                        messagebox.showwarning("警告", "该场景名称已存在")
+                        return
+                    
+                    # 重命名场景
+                    if old_name in self.scenarios:
+                        self.scenarios[name] = self.scenarios.pop(old_name)
+                    self.save_config()
+                    refresh_tree()
+                    self.update_target_checkboxes()
+                    edit_window.destroy()
+                
+                button_frame_edit = ttk.Frame(frame)
+                button_frame_edit.grid(row=1, column=0, columnspan=2, pady=10)
+                ttk.Button(button_frame_edit, text="保存", command=save_scenario).pack(side=tk.LEFT, padx=5)
+                ttk.Button(button_frame_edit, text="取消", command=edit_window.destroy).pack(side=tk.LEFT, padx=5)
+                
+                frame.columnconfigure(1, weight=1)
+                
+            elif 'subdir' in tree.item(selection[0], 'tags'):
+                # 编辑子目录
+                old_subdir_name = item['text']
+                old_path = item['values'][0]
+                parent_item = tree.parent(selection[0])
+                scenario_name = tree.item(parent_item)['text']
+                
+                edit_window = tk.Toplevel(config_window)
+                edit_window.title(f"编辑场景 '{scenario_name}' 的子目录")
+                edit_window.geometry("450x150")
+                edit_window.transient(config_window)
+                edit_window.grab_set()
+                
+                # 居中显示对话框
+                edit_window.update_idletasks()
+                x = config_window.winfo_x() + (config_window.winfo_width() // 2) - (450 // 2)
+                y = config_window.winfo_y() + (config_window.winfo_height() // 2) - (150 // 2)
+                edit_window.geometry(f"450x150+{x}+{y}")
+                
+                frame = ttk.Frame(edit_window, padding="10")
+                frame.pack(fill=tk.BOTH, expand=True)
+                
+                ttk.Label(frame, text="子目录名称:").grid(row=0, column=0, sticky=tk.W, pady=5)
+                name_var = tk.StringVar(value=old_subdir_name)
+                ttk.Entry(frame, textvariable=name_var, width=30).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+                
+                ttk.Label(frame, text="路径:").grid(row=1, column=0, sticky=tk.W, pady=5)
+                path_var = tk.StringVar(value=old_path)
+                path_entry = ttk.Entry(frame, textvariable=path_var, width=30)
+                path_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+                
+                def browse_path():
+                    directory = filedialog.askdirectory(title="选择目标目录")
+                    if directory:
+                        path_var.set(directory)
+                
+                ttk.Button(frame, text="浏览", command=browse_path).grid(row=1, column=2, padx=5, pady=5)
+                
+                def save_subdir():
+                    name = name_var.get().strip()
+                    path = path_var.get().strip()
+                    if not name or not path:
+                        messagebox.showwarning("警告", "请填写完整的名称和路径")
+                        return
+                    if name != old_subdir_name and name in self.scenarios[scenario_name]:
+                        messagebox.showwarning("警告", "该子目录名称在此场景中已存在")
+                        return
+                    if not os.path.exists(path):
+                        messagebox.showwarning("警告", "路径不存在")
+                        return
+                    
+                    # 删除旧的，添加新的
+                    if old_subdir_name in self.scenarios[scenario_name]:
+                        del self.scenarios[scenario_name][old_subdir_name]
+                    self.scenarios[scenario_name][name] = path
+                    self.save_config()
+                    refresh_tree()
+                    self.update_target_checkboxes()
+                    edit_window.destroy()
+                
+                button_frame_edit = ttk.Frame(frame)
+                button_frame_edit.grid(row=2, column=0, columnspan=3, pady=10)
+                ttk.Button(button_frame_edit, text="保存", command=save_subdir).pack(side=tk.LEFT, padx=5)
+                ttk.Button(button_frame_edit, text="取消", command=edit_window.destroy).pack(side=tk.LEFT, padx=5)
+                
+                frame.columnconfigure(1, weight=1)
         
-        ttk.Button(button_frame, text="添加", command=add_directory).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="编辑", command=edit_directory).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="删除", command=delete_directory).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="添加场景", command=add_scenario).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="添加子目录", command=add_subdir).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="编辑", command=edit_item).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="删除", command=delete_item).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="关闭", command=config_window.destroy).pack(side=tk.RIGHT, padx=5)
     
     def create_widgets(self):
@@ -446,17 +605,41 @@ class ImageManager:
             # 清除旧的变量
             self.target_checkbox_vars.clear()
             
-            # 为每个目录创建复选框
-            for i, (name, path) in enumerate(self.target_directories.items()):
-                var = tk.BooleanVar()
-                self.target_checkbox_vars[name] = var
-                
-                checkbox = ttk.Checkbutton(
+            row = 0
+            # 为每个场景和子目录创建复选框
+            for scenario_name, subdirs in self.scenarios.items():
+                # 创建场景标签
+                scenario_label = ttk.Label(
                     self.target_checkboxes_frame,
-                    text=f"{name} ({path})",
-                    variable=var
+                    text=f"场景: {scenario_name}",
+                    font=('TkDefaultFont', 9, 'bold')
                 )
-                checkbox.grid(row=i, column=0, sticky=tk.W, pady=2)
+                scenario_label.grid(row=row, column=0, sticky=tk.W, pady=(5, 2))
+                row += 1
+                
+                # 为场景下的每个子目录创建复选框
+                for subdir_name, subdir_path in subdirs.items():
+                    var = tk.BooleanVar()
+                    # 使用场景名和子目录名的组合作为键，确保唯一性
+                    key = f"{scenario_name}::{subdir_name}"
+                    self.target_checkbox_vars[key] = var
+                    
+                    checkbox = ttk.Checkbutton(
+                        self.target_checkboxes_frame,
+                        text=f"  └ {subdir_name} ({subdir_path})",
+                        variable=var
+                    )
+                    checkbox.grid(row=row, column=0, sticky=tk.W, pady=1, padx=(20, 0))
+                    row += 1
+            
+            # 如果没有场景，显示提示信息
+            if not self.scenarios:
+                no_data_label = ttk.Label(
+                    self.target_checkboxes_frame,
+                    text="暂无配置的场景和子目录",
+                    foreground='gray'
+                )
+                no_data_label.grid(row=0, column=0, sticky=tk.W, pady=5)
     
     def browse_dataset_dir(self):
         """浏览数据集目录"""
@@ -904,14 +1087,26 @@ class ImageManager:
         """处理数据集（复制或移动images和labels目录）"""
         # 获取选中的目标目录
         selected_targets = []
-        for name, var in self.target_checkbox_vars.items():
+        for key, var in self.target_checkbox_vars.items():
             if var.get():
-                if name in self.target_directories:
-                    target_path = self.target_directories[name]
+                # 解析场景和子目录名称
+                if "::" in key:
+                    scenario_name, subdir_name = key.split("::", 1)
+                    if scenario_name in self.scenarios and subdir_name in self.scenarios[scenario_name]:
+                        target_path = self.scenarios[scenario_name][subdir_name]
+                        display_name = f"{scenario_name}/{subdir_name}"
+                        if os.path.exists(target_path):
+                            selected_targets.append((display_name, target_path))
+                        else:
+                            messagebox.showerror("错误", f"目标目录不存在: {display_name} ({target_path})")
+                            return
+                # 兼容旧格式
+                elif key in self.target_directories:
+                    target_path = self.target_directories[key]
                     if os.path.exists(target_path):
-                        selected_targets.append((name, target_path))
+                        selected_targets.append((key, target_path))
                     else:
-                        messagebox.showerror("错误", f"目标目录不存在: {name} ({target_path})")
+                        messagebox.showerror("错误", f"目标目录不存在: {key} ({target_path})")
                         return
         
         if not selected_targets:
