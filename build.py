@@ -5,10 +5,14 @@
 使用PyInstaller将Python程序打包成exe文件
 """
 
-import os
+import os, io
 import sys
 import subprocess
 from pathlib import Path
+
+# 强制标准输出/错误使用 UTF-8 编码（兼容 Windows CI）
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 def build_exe():
     """构建exe文件"""
