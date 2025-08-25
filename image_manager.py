@@ -67,6 +67,7 @@ class ImageManager:
         self.target_directories = {}  # 兼容旧格式 {名称: 路径}
         self.scenarios = {}  # 新格式 {场景名称: {子目录名称: 路径}}
         self.selected_target = tk.StringVar()
+        self.scenario_collapsed = {}  # 场景折叠状态 {场景名称: True/False}
         
         # 加载配置
         self.load_config()
@@ -505,20 +506,7 @@ class ImageManager:
         self.status_label = ttk.Label(main_frame, text="请选择数据集目录")
         self.status_label.grid(row=2, column=0, columnspan=3, pady=5)
         
-        # 图片列表框架
-        list_frame = ttk.LabelFrame(main_frame, text="图片列表", padding="5")
-        list_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=10)
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
-        
-        # 图片列表
-        self.image_listbox = tk.Listbox(list_frame, height=10)
-        self.image_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # 滚动条
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.image_listbox.yview)
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        self.image_listbox.configure(yscrollcommand=scrollbar.set)
+        # 移除图片列表展示区域以拓宽目标目录展示
         
         # 控制按钮框架
         control_frame = ttk.LabelFrame(main_frame, text="图片范围选择", padding="5")
@@ -548,10 +536,11 @@ class ImageManager:
         self.range_label = ttk.Label(control_frame, text="选择范围: 未设置")
         self.range_label.grid(row=2, column=0, columnspan=2, pady=5)
         
-        # 目标目录选择
+        # 目标目录选择（拓宽显示区域）
         target_frame = ttk.LabelFrame(main_frame, text="目标操作", padding="5")
-        target_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
+        target_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=10)
         target_frame.columnconfigure(0, weight=1)
+        target_frame.rowconfigure(0, weight=1)
         
         # 目录列表框架
         dir_list_frame = ttk.Frame(target_frame)
@@ -560,21 +549,44 @@ class ImageManager:
         
         ttk.Label(dir_list_frame, text="选择目标目录:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
         
-        # 创建滚动框架用于复选框列表
-        canvas = tk.Canvas(dir_list_frame, height=120)
-        scrollbar = ttk.Scrollbar(dir_list_frame, orient="vertical", command=canvas.yview)
-        self.target_checkboxes_frame = ttk.Frame(canvas)
+        # 创建滚动框架用于复选框列表（增加高度）
+        self.canvas = tk.Canvas(dir_list_frame, height=300)
+        scrollbar = ttk.Scrollbar(dir_list_frame, orient="vertical", command=self.canvas.yview)
+        self.target_checkboxes_frame = ttk.Frame(self.canvas)
         
         self.target_checkboxes_frame.bind(
             "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         )
         
-        canvas.create_window((0, 0), window=self.target_checkboxes_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.create_window((0, 0), window=self.target_checkboxes_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
         
-        canvas.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        # 绑定鼠标滚轮事件
+        def on_mousewheel(event):
+            # 检查canvas是否有滚动内容
+            if self.canvas.winfo_exists():
+                # 获取滚动区域
+                bbox = self.canvas.bbox("all")
+                if bbox and bbox[3] > self.canvas.winfo_height():
+                    self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        # 绑定滚轮事件到多个组件
+        def bind_mousewheel(widget):
+            widget.bind("<MouseWheel>", on_mousewheel)
+            # 递归绑定到所有子组件
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+        
+        bind_mousewheel(self.canvas)
+        bind_mousewheel(self.target_checkboxes_frame)
+        bind_mousewheel(dir_list_frame)
+        
+        self.canvas.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scrollbar.grid(row=1, column=1, sticky=(tk.N, tk.S))
+        
+        # 配置dir_list_frame的行权重
+        dir_list_frame.rowconfigure(1, weight=1)
         
         # 配置按钮
         ttk.Button(dir_list_frame, text="配置目录", command=self.open_target_config).grid(row=2, column=0, pady=(5, 0), sticky=tk.W)
@@ -589,11 +601,47 @@ class ImageManager:
         ttk.Button(button_frame, text="复制选中图片", command=self.copy_images).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="移动选中图片", command=self.move_images).pack(side=tk.LEFT, padx=5)
         
-        # 配置主框架的行权重
+        # 配置主框架的行权重（调整为目标目录区域）
         main_frame.rowconfigure(3, weight=1)
         
         # 初始化目标目录复选框
         self.update_target_checkboxes()
+    
+    def toggle_scenario_collapse(self, scenario_name):
+        """切换场景的折叠/展开状态"""
+        self.scenario_collapsed[scenario_name] = not self.scenario_collapsed.get(scenario_name, False)
+        
+        # 优化：只更新相关场景的显示状态，而不是重建整个界面
+        self.update_scenario_display(scenario_name)
+    
+    def on_mousewheel(self, event):
+        """鼠标滚轮事件处理"""
+        # 检查canvas是否有滚动内容
+        if hasattr(self, 'canvas') and self.canvas.winfo_exists():
+            # 获取滚动区域
+            bbox = self.canvas.bbox("all")
+            if bbox and bbox[3] > self.canvas.winfo_height():
+                self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    
+    def update_scenario_display(self, scenario_name):
+        """优化：只更新指定场景的显示状态"""
+        if not hasattr(self, 'scenario_widgets'):
+            return
+            
+        if scenario_name in self.scenario_widgets:
+            scenario_data = self.scenario_widgets[scenario_name]
+            is_collapsed = self.scenario_collapsed.get(scenario_name, False)
+            collapse_symbol = "▶" if is_collapsed else "▼"
+            
+            # 更新场景标签的折叠符号
+            scenario_data['label'].config(text=f"{collapse_symbol} 场景: {scenario_name}")
+            
+            # 显示或隐藏子目录复选框
+            for checkbox in scenario_data['checkboxes']:
+                if is_collapsed:
+                    checkbox.grid_remove()  # 隐藏但不销毁
+                else:
+                    checkbox.grid()  # 重新显示
     
     def update_target_checkboxes(self):
         """更新目标目录复选框列表"""
@@ -602,22 +650,48 @@ class ImageManager:
             for widget in self.target_checkboxes_frame.winfo_children():
                 widget.destroy()
             
-            # 清除旧的变量
+            # 清除旧的变量和组件缓存
             self.target_checkbox_vars.clear()
+            self.scenario_widgets = {}  # 缓存场景组件
             
             row = 0
             # 为每个场景和子目录创建复选框
             for scenario_name, subdirs in self.scenarios.items():
-                # 创建场景标签
+                # 初始化场景折叠状态（默认展开）
+                if scenario_name not in self.scenario_collapsed:
+                    self.scenario_collapsed[scenario_name] = False
+                
+                is_collapsed = self.scenario_collapsed[scenario_name]
+                collapse_symbol = "▶" if is_collapsed else "▼"
+                
+                # 创建可点击的场景标签
+                scenario_frame = ttk.Frame(self.target_checkboxes_frame)
+                scenario_frame.grid(row=row, column=0, sticky=tk.W, pady=(5, 2))
+                
                 scenario_label = ttk.Label(
-                    self.target_checkboxes_frame,
-                    text=f"场景: {scenario_name}",
-                    font=('TkDefaultFont', 9, 'bold')
+                    scenario_frame,
+                    text=f"{collapse_symbol} 场景: {scenario_name}",
+                    font=('TkDefaultFont', 9, 'bold'),
+                    cursor="hand2"
                 )
-                scenario_label.grid(row=row, column=0, sticky=tk.W, pady=(5, 2))
+                scenario_label.pack(side=tk.LEFT)
+                
+                # 绑定点击事件和滚轮事件
+                scenario_label.bind("<Button-1>", lambda e, name=scenario_name: self.toggle_scenario_collapse(name))
+                scenario_label.bind("<MouseWheel>", self.on_mousewheel)
+                scenario_frame.bind("<MouseWheel>", self.on_mousewheel)
+                
+                # 缓存场景组件
+                scenario_checkboxes = []
+                self.scenario_widgets[scenario_name] = {
+                    'frame': scenario_frame,
+                    'label': scenario_label,
+                    'checkboxes': scenario_checkboxes
+                }
+                
                 row += 1
                 
-                # 为场景下的每个子目录创建复选框
+                # 为场景下的每个子目录创建复选框（始终创建，但根据折叠状态决定是否显示）
                 for subdir_name, subdir_path in subdirs.items():
                     var = tk.BooleanVar()
                     # 使用场景名和子目录名的组合作为键，确保唯一性
@@ -629,7 +703,20 @@ class ImageManager:
                         text=f"  └ {subdir_name} ({subdir_path})",
                         variable=var
                     )
-                    checkbox.grid(row=row, column=0, sticky=tk.W, pady=1, padx=(20, 0))
+                    
+                    # 根据折叠状态决定是否显示
+                    if not is_collapsed:
+                        checkbox.grid(row=row, column=0, sticky=tk.W, pady=1, padx=(20, 0))
+                    else:
+                        checkbox.grid(row=row, column=0, sticky=tk.W, pady=1, padx=(20, 0))
+                        checkbox.grid_remove()  # 创建后立即隐藏
+                    
+                    # 为新创建的复选框绑定滚轮事件
+                    checkbox.bind("<MouseWheel>", self.on_mousewheel)
+                    
+                    # 添加到场景的复选框列表
+                    scenario_checkboxes.append(checkbox)
+                    
                     row += 1
             
             # 如果没有场景，显示提示信息
@@ -743,10 +830,9 @@ class ImageManager:
         return self.image_files == sorted_files
     
     def update_image_list(self):
-        """更新图片列表显示"""
-        self.image_listbox.delete(0, tk.END)
-        for image_file in self.image_files:
-            self.image_listbox.insert(tk.END, os.path.basename(image_file))
+        """更新图片列表显示（已移除图片列表展示）"""
+        # 图片列表展示已移除，此方法保留为兼容性
+        pass
     
     def start_file_monitoring(self):
         """启动文件监控"""
