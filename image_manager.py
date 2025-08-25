@@ -1232,14 +1232,21 @@ class ImageManager:
                     failed_operations.append(f"创建目录结构 -> {target_name}: {str(e)}")
                     continue
             
+            # 存储需要删除的原文件（仅用于移动操作）
+            files_to_delete = []
+            
             for image_path in selected_images:
                 filename = os.path.basename(image_path)
                 # 获取对应的label文件名（假设扩展名为.txt）
                 label_filename = os.path.splitext(filename)[0] + ".txt"
                 label_path = labels_path / label_filename
                 
-                # 对于移动操作，只移动到第一个目标目录，其他目录执行复制
-                for i, (target_name, target_path) in enumerate(selected_targets):
+                # 记录需要删除的文件（移动操作时使用）
+                if not copy:
+                    files_to_delete.append((image_path, label_path if label_path.exists() else None))
+                
+                # 先复制到所有目标目录
+                for target_name, target_path in selected_targets:
                     target_images_dir = Path(target_path) / "images"
                     target_labels_dir = Path(target_path) / "labels"
                     target_image_path = target_images_dir / filename
@@ -1247,22 +1254,31 @@ class ImageManager:
                     
                     try:
                         # 处理图片文件
-                        if copy or i > 0:  # 复制操作或移动时的后续目录
-                            shutil.copy2(image_path, target_image_path)
-                        else:  # 移动操作的第一个目录
-                            shutil.move(image_path, target_image_path)
+                        shutil.copy2(image_path, target_image_path)
                         total_operations += 1
                         
                         # 处理对应的label文件（如果存在）
                         if label_path.exists():
-                            if copy or i > 0:  # 复制操作或移动时的后续目录
-                                shutil.copy2(str(label_path), target_label_path)
-                            else:  # 移动操作的第一个目录
-                                shutil.move(str(label_path), target_label_path)
+                            shutil.copy2(str(label_path), target_label_path)
                             total_operations += 1
                         
                     except Exception as e:
                         failed_operations.append(f"{filename} -> {target_name}: {str(e)}")
+            
+            # 如果是移动操作，删除原文件
+            if not copy:
+                for image_path, label_path in files_to_delete:
+                    try:
+                        # 删除图片文件
+                        if os.path.exists(image_path):
+                            os.remove(image_path)
+                        
+                        # 删除对应的label文件（如果存在）
+                        if label_path and os.path.exists(label_path):
+                            os.remove(label_path)
+                            
+                    except Exception as e:
+                        failed_operations.append(f"删除原文件 {os.path.basename(image_path)}: {str(e)}")
             
             # 显示结果
             if failed_operations:
