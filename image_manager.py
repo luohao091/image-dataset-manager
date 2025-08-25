@@ -1291,6 +1291,11 @@ class ImageManager:
                 messagebox.showinfo("成功", 
                     f"成功{operation}了 {len(selected_images)} 个数据集文件到 {len(selected_targets)} 个目录")
             
+            # 清除所有选中的复选框
+            for key, var in self.target_checkbox_vars.items():
+                if var.get():
+                    var.set(False)
+            
             # 如果是移动操作，重新检测目录
             if not copy:
                 self.detect_images()
