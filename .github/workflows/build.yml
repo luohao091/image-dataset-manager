@@ -8,6 +8,9 @@ on:
   release:
     types: [created]
 
+permissions:
+  contents: write   # 必须有这个，否则 GITHUB_TOKEN 没法创建 Release
+  
 jobs:
   build:
     runs-on: windows-latest
