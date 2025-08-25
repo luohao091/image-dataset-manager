@@ -1,0 +1,80 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+    
+    - name: Build executable
+      run: |
+        python build.py
+    
+    - name: Get version from tag
+      id: get_version
+      run: |
+        $version = $env:GITHUB_REF -replace 'refs/tags/v', ''
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+      shell: pwsh
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Image Dataset Manager v${{ steps.get_version.outputs.version }}
+        body: |
+          ## 更新内容
+          
+          ### 新功能
+          - 自动检测当前查看的图片
+          - 支持YOLO格式数据集管理
+          - 批量复制/移动操作
+          - 手动检测功能
+          
+          ### 支持的图片查看器
+          - Windows照片查看器
+          - IrfanView
+          - FastStone Image Viewer
+          - XnView
+          - Honeyview
+          - 2345看图王
+          - ACDSee
+          
+          ### 系统要求
+          - Windows 10/11
+          - .NET Framework 4.7.2+
+          
+          **下载 `image_manager.exe` 文件即可使用**
+        draft: false
+        prerelease: false
+    
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/image_manager.exe
+        asset_name: image_manager.exe
+        asset_content_type: application/octet-stream
