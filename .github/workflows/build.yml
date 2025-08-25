@@ -13,7 +13,8 @@ jobs:
     runs-on: windows-latest
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
     
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -29,6 +30,8 @@ jobs:
     - name: Build executable
       run: |
         python build.py
+      env:
+        PYTHONUTF8: 1   # 强制 Python 使用 UTF-8，避免中文输出时报错
     
     - name: Upload artifact
       uses: actions/upload-artifact@v3
