@@ -876,6 +876,9 @@ class ImageManager:
             else:
                 status_text += " (无序)"
             
+            # 添加检测完成日志
+            self.add_operation_log(f"检测完成: 找到 {len(self.image_files)} 个图片文件 {('(有序)' if is_ordered else '(无序)')}")
+            
             self.root.after(0, lambda: self.status_label.config(text=status_text))
             
         except Exception as e:
@@ -1147,9 +1150,27 @@ class ImageManager:
         """验证并设置当前图片"""
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
         
+        # 标准化路径以支持SMB挂载路径
+        normalized_file_path = os.path.normpath(file_path)
+        
+        # 检查文件是否在图片列表中（使用标准化路径比较）
+        file_in_list = False
+        if hasattr(self, 'image_files'):
+            # 标准化所有图片文件路径进行比较
+            normalized_image_files = [os.path.normpath(img_path) for img_path in self.image_files]
+            file_in_list = normalized_file_path in normalized_image_files
+            
+            # 如果标准化路径比较失败，尝试文件名比较（适用于SMB路径格式差异）
+            if not file_in_list:
+                current_filename = os.path.basename(file_path)
+                for img_path in self.image_files:
+                    if os.path.basename(img_path) == current_filename:
+                        file_in_list = True
+                        break
+        
         if (os.path.exists(file_path) and 
             Path(file_path).suffix.lower() in image_extensions and
-            hasattr(self, 'image_files') and file_path in self.image_files):
+            file_in_list):
             
             if is_manual_detection:
                 print(f"[手动检测] 成功检测到当前打开的图片: {file_path}")
@@ -1162,9 +1183,9 @@ class ImageManager:
             return True
         else:
             if is_manual_detection:
-                print(f"[手动检测] 文件不符合条件: {file_path} (存在:{os.path.exists(file_path)}, 是图片:{Path(file_path).suffix.lower() in image_extensions}, 在列表中:{file_path in self.image_files if hasattr(self, 'image_files') else 'image_files未定义'})")
+                print(f"[手动检测] 文件不符合条件: {file_path} (存在:{os.path.exists(file_path)}, 是图片:{Path(file_path).suffix.lower() in image_extensions}, 在列表中:{file_in_list})")
             else:
-                print(f"文件不符合条件: {file_path} (存在:{os.path.exists(file_path)}, 是图片:{Path(file_path).suffix.lower() in image_extensions}, 在列表中:{file_path in self.image_files if hasattr(self, 'image_files') else 'image_files未定义'})")
+                print(f"文件不符合条件: {file_path} (存在:{os.path.exists(file_path)}, 是图片:{Path(file_path).suffix.lower() in image_extensions}, 在列表中:{file_in_list})")
             return False
     
     def on_image_opened(self, file_path):
@@ -1354,9 +1375,13 @@ class ImageManager:
                     error_msg += f"\n... 还有 {len(failed_operations) - 5} 个失败"
                 messagebox.showwarning("部分成功", 
                     f"成功{operation}了 {total_operations} 次\n\n{error_msg}")
+                # 添加部分成功的操作日志
+                self.add_operation_log(f"{operation}操作部分成功: 成功 {total_operations} 次，失败 {len(failed_operations)} 次")
             else:
                 messagebox.showinfo("成功", 
                     f"成功{operation}了 {len(selected_images)} 个数据集文件到 {len(selected_targets)} 个目录")
+                # 添加成功的操作日志
+                self.add_operation_log(f"{operation}操作完成: 成功{operation}了 {len(selected_images)} 个数据集文件到 {len(selected_targets)} 个目录")
             
             # 清除所有选中的复选框
             for key, var in self.target_checkbox_vars.items():
@@ -1369,6 +1394,8 @@ class ImageManager:
                 
         except Exception as e:
             messagebox.showerror("错误", f"{operation}过程中出现错误: {str(e)}")
+            # 添加错误的操作日志
+            self.add_operation_log(f"{operation}操作失败: {str(e)}")
     
     def start_manual_detection(self):
         """开始手动检测模式"""
