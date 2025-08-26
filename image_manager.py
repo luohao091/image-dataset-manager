@@ -542,17 +542,54 @@ class ImageManager:
         target_frame.columnconfigure(0, weight=1)
         target_frame.rowconfigure(0, weight=1)
         
-        # 目录列表框架
-        dir_list_frame = ttk.Frame(target_frame)
-        dir_list_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+        # 创建可调节大小的左右分栏布局
+        content_paned = ttk.PanedWindow(target_frame, orient=tk.HORIZONTAL)
+        content_paned.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        # 左侧：目录列表框架
+        dir_list_frame = ttk.LabelFrame(content_paned, text="选择目标目录", padding="5")
         dir_list_frame.columnconfigure(0, weight=1)
+        dir_list_frame.rowconfigure(0, weight=1)
         
-        ttk.Label(dir_list_frame, text="选择目标目录:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
-        
-        # 创建滚动框架用于复选框列表（增加高度）
-        self.canvas = tk.Canvas(dir_list_frame, height=300)
+        # 创建滚动框架用于复选框列表
+        self.canvas = tk.Canvas(dir_list_frame, height=280, relief="solid", bd=1)
         scrollbar = ttk.Scrollbar(dir_list_frame, orient="vertical", command=self.canvas.yview)
         self.target_checkboxes_frame = ttk.Frame(self.canvas)
+        
+        # 右侧：操作信息框架
+        info_frame = ttk.LabelFrame(content_paned, text="操作信息", padding="5")
+        info_frame.columnconfigure(0, weight=1)
+        info_frame.rowconfigure(1, weight=1)
+        
+        # 将左右两个框架添加到PanedWindow中
+        content_paned.add(dir_list_frame, weight=1)
+        content_paned.add(info_frame, weight=1)
+        
+        # 操作状态显示
+        self.operation_status = tk.Text(info_frame, height=12, width=40, wrap=tk.WORD, 
+                                       relief="solid", bd=1, bg="#ffffff", 
+                                       font=('Consolas', 9), state=tk.DISABLED)
+        info_scrollbar = ttk.Scrollbar(info_frame, orient="vertical", command=self.operation_status.yview)
+        self.operation_status.configure(yscrollcommand=info_scrollbar.set)
+        
+        ttk.Label(info_frame, text="操作日志:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        self.operation_status.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        info_scrollbar.grid(row=1, column=1, sticky=(tk.N, tk.S))
+        
+        # 操作按钮框架
+        operation_btn_frame = ttk.Frame(info_frame)
+        operation_btn_frame.grid(row=2, column=0, columnspan=2, pady=(10, 0), sticky=(tk.W, tk.E))
+        
+        # 复制和移动按钮
+        ttk.Button(operation_btn_frame, text="复制图片", command=self.copy_images).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(operation_btn_frame, text="移动图片", command=self.move_images).pack(side=tk.LEFT)
+        
+        # 添加初始日志信息
+        self.operation_status.config(state=tk.NORMAL)
+        self.operation_status.insert(tk.END, "欢迎使用图片管理器\n")
+        self.operation_status.insert(tk.END, "请选择数据集目录开始检测\n")
+        self.operation_status.insert(tk.END, "选择目标目录后可进行复制或移动操作\n")
+        self.operation_status.config(state=tk.DISABLED)
         
         self.target_checkboxes_frame.bind(
             "<Configure>",
@@ -582,30 +619,31 @@ class ImageManager:
         bind_mousewheel(self.target_checkboxes_frame)
         bind_mousewheel(dir_list_frame)
         
-        self.canvas.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        scrollbar.grid(row=1, column=1, sticky=(tk.N, tk.S))
-        
-        # 配置dir_list_frame的行权重
-        dir_list_frame.rowconfigure(1, weight=1)
+        self.canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         
         # 配置按钮
-        ttk.Button(dir_list_frame, text="配置目录", command=self.open_target_config).grid(row=2, column=0, pady=(5, 0), sticky=tk.W)
+        config_btn_frame = ttk.Frame(dir_list_frame)
+        config_btn_frame.grid(row=1, column=0, columnspan=2, pady=(5, 0), sticky=tk.W)
+        ttk.Button(config_btn_frame, text="配置目录", command=self.open_target_config).pack(side=tk.LEFT)
+        ttk.Button(config_btn_frame, text="全部展开", command=self.expand_all_scenarios).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(config_btn_frame, text="全部收起", command=self.collapse_all_scenarios).pack(side=tk.LEFT, padx=(5, 0))
         
         # 存储复选框变量的字典
         self.target_checkbox_vars = {}
         
-        # 操作按钮
-        button_frame = ttk.Frame(target_frame)
-        button_frame.grid(row=1, column=0, columnspan=3, pady=10)
-        
-        ttk.Button(button_frame, text="复制选中图片", command=self.copy_images).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="移动选中图片", command=self.move_images).pack(side=tk.LEFT, padx=5)
-        
-        # 配置主框架的行权重（调整为目标目录区域）
-        main_frame.rowconfigure(3, weight=1)
-        
         # 初始化目标目录复选框
         self.update_target_checkboxes()
+        
+    def add_operation_log(self, message):
+        """添加操作日志"""
+        if hasattr(self, 'operation_status'):
+            self.operation_status.config(state=tk.NORMAL)
+            timestamp = time.strftime("%H:%M:%S")
+            self.operation_status.insert(tk.END, f"[{timestamp}] {message}\n")
+            self.operation_status.see(tk.END)
+            self.operation_status.config(state=tk.DISABLED)
+            self.root.update_idletasks()
     
     def toggle_scenario_collapse(self, scenario_name):
         """切换场景的折叠/展开状态"""
@@ -613,6 +651,26 @@ class ImageManager:
         
         # 优化：只更新相关场景的显示状态，而不是重建整个界面
         self.update_scenario_display(scenario_name)
+    
+    def expand_all_scenarios(self):
+        """展开所有场景"""
+        if hasattr(self, 'scenarios') and self.scenarios:
+            for scenario_name in self.scenarios.keys():
+                self.scenario_collapsed[scenario_name] = False
+                self.update_scenario_display(scenario_name, update_scroll=False)
+            # 统一更新滚动区域，提高性能
+            self.update_canvas_scroll()
+        self.add_operation_log("已展开所有场景")
+    
+    def collapse_all_scenarios(self):
+        """收起所有场景"""
+        if hasattr(self, 'scenarios') and self.scenarios:
+            for scenario_name in self.scenarios.keys():
+                self.scenario_collapsed[scenario_name] = True
+                self.update_scenario_display(scenario_name, update_scroll=False)
+            # 统一更新滚动区域，提高性能
+            self.update_canvas_scroll()
+        self.add_operation_log("已收起所有场景")
     
     def on_mousewheel(self, event):
         """鼠标滚轮事件处理"""
@@ -623,7 +681,7 @@ class ImageManager:
             if bbox and bbox[3] > self.canvas.winfo_height():
                 self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
     
-    def update_scenario_display(self, scenario_name):
+    def update_scenario_display(self, scenario_name, update_scroll=True):
         """优化：只更新指定场景的显示状态"""
         if not hasattr(self, 'scenario_widgets'):
             return
@@ -642,6 +700,16 @@ class ImageManager:
                     checkbox.grid_remove()  # 隐藏但不销毁
                 else:
                     checkbox.grid()  # 重新显示
+            
+            # 根据参数决定是否更新Canvas的滚动区域
+            if update_scroll:
+                self.update_canvas_scroll()
+    
+    def update_canvas_scroll(self):
+        """更新Canvas的滚动区域"""
+        if hasattr(self, 'target_checkboxes_frame') and hasattr(self, 'canvas'):
+            self.target_checkboxes_frame.update_idletasks()
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
     
     def update_target_checkboxes(self):
         """更新目标目录复选框列表"""
@@ -705,11 +773,9 @@ class ImageManager:
                     )
                     
                     # 根据折叠状态决定是否显示
-                    if not is_collapsed:
-                        checkbox.grid(row=row, column=0, sticky=tk.W, pady=1, padx=(20, 0))
-                    else:
-                        checkbox.grid(row=row, column=0, sticky=tk.W, pady=1, padx=(20, 0))
-                        checkbox.grid_remove()  # 创建后立即隐藏
+                    checkbox.grid(row=row, column=0, sticky=tk.W, pady=1, padx=(20, 0))
+                    if is_collapsed:
+                        checkbox.grid_remove()  # 如果折叠则隐藏
                     
                     # 为新创建的复选框绑定滚轮事件
                     checkbox.bind("<MouseWheel>", self.on_mousewheel)
@@ -747,6 +813,7 @@ class ImageManager:
         if self.is_detecting:
             self.stop_detection()
         else:
+            self.add_operation_log(f"开始检测目录: {self.source_dir.get()}")
             self.is_detecting = True
             self.detect_btn.config(text="停止检测")
             self.status_label.config(text="正在检测数据集目录...")
