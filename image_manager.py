@@ -20,6 +20,8 @@ from PIL import Image, ImageTk
 import psutil
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+import queue
+from concurrent.futures import ThreadPoolExecutor
 try:
     import win32gui
     import win32process
@@ -27,6 +29,103 @@ try:
 except ImportError:
     WIN32_AVAILABLE = False
     print("注意: pywin32库未安装，窗口监控功能将被禁用。如需完整功能，请运行: pip install pywin32")
+
+class ProgressDialog:
+    """进度条对话框"""
+    
+    def __init__(self, parent, title="操作进度"):
+        self.parent = parent
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title(title)
+        self.dialog.geometry("500x300")
+        self.dialog.resizable(False, False)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        # 居中显示
+        self.dialog.geometry("+%d+%d" % (parent.winfo_rootx() + 50, parent.winfo_rooty() + 50))
+        
+        # 创建界面
+        self.create_widgets()
+        
+        # 任务相关变量
+        self.tasks = {}  # {task_id: {"name": str, "progress": int, "status": str}}
+        self.cancelled = False
+        
+    def create_widgets(self):
+        """创建界面组件"""
+        # 主框架
+        main_frame = ttk.Frame(self.dialog, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 总体进度标签
+        self.overall_label = ttk.Label(main_frame, text="准备开始...", font=("Arial", 10, "bold"))
+        self.overall_label.pack(pady=(0, 10))
+        
+        # 总体进度条
+        self.overall_progress = ttk.Progressbar(main_frame, mode='determinate')
+        self.overall_progress.pack(fill=tk.X, pady=(0, 20))
+        
+        # 任务列表框架
+        list_frame = ttk.LabelFrame(main_frame, text="任务详情", padding="5")
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # 创建滚动文本框显示任务进度
+        self.text_frame = tk.Frame(list_frame)
+        self.text_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.text_widget = tk.Text(self.text_frame, height=8, wrap=tk.WORD, state=tk.DISABLED)
+        scrollbar = ttk.Scrollbar(self.text_frame, orient=tk.VERTICAL, command=self.text_widget.yview)
+        self.text_widget.configure(yscrollcommand=scrollbar.set)
+        
+        self.text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 按钮框架
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X)
+        
+        self.cancel_button = ttk.Button(button_frame, text="取消", command=self.cancel_task)
+        self.cancel_button.pack(side=tk.RIGHT, padx=(5, 0))
+        
+        self.close_button = ttk.Button(button_frame, text="关闭", command=self.close_dialog, state=tk.DISABLED)
+        self.close_button.pack(side=tk.RIGHT)
+        
+    def update_overall_progress(self, current, total, text=""):
+        """更新总体进度"""
+        if total > 0:
+            progress = (current / total) * 100
+            self.overall_progress['value'] = progress
+            
+        if text:
+            self.overall_label.config(text=text)
+            
+    def add_task_log(self, message):
+        """添加任务日志"""
+        self.text_widget.config(state=tk.NORMAL)
+        self.text_widget.insert(tk.END, f"{time.strftime('%H:%M:%S')} - {message}\n")
+        self.text_widget.see(tk.END)
+        self.text_widget.config(state=tk.DISABLED)
+        
+    def cancel_task(self):
+        """取消任务"""
+        self.cancelled = True
+        self.cancel_button.config(state=tk.DISABLED)
+        self.add_task_log("正在取消任务...")
+        
+    def task_completed(self):
+        """任务完成"""
+        self.cancel_button.config(state=tk.DISABLED)
+        self.close_button.config(state=tk.NORMAL)
+        self.overall_progress['value'] = 100
+        
+    def close_dialog(self):
+        """关闭对话框"""
+        self.dialog.destroy()
+        
+    def is_cancelled(self):
+        """检查是否已取消"""
+        return self.cancelled
 
 class ImageFileHandler(FileSystemEventHandler):
     """文件系统事件处理器，用于跟踪图片文件的打开"""
@@ -68,6 +167,13 @@ class ImageManager:
         self.scenarios = {}  # 新格式 {场景名称: {子目录名称: 路径}}
         self.selected_target = tk.StringVar()
         self.scenario_collapsed = {}  # 场景折叠状态 {场景名称: True/False}
+        
+        # 异步任务相关变量
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        self.task_queue = queue.Queue()
+        self.progress_dialog = None
+        self.current_task = None
+        self.task_cancelled = False
         
         # 加载配置
         self.load_config()
@@ -1304,37 +1410,78 @@ class ImageManager:
         if not result:
             return
         
+        # 启动异步任务
+        self.start_async_process(selected_images, selected_targets, images_path, labels_path, copy)
+    
+    def start_async_process(self, selected_images, selected_targets, images_path, labels_path, copy):
+        """启动异步处理任务"""
+        operation = "复制" if copy else "移动"
+        
+        # 创建进度对话框
+        self.progress_dialog = ProgressDialog(self.root, f"{operation}进度")
+        self.progress_dialog.add_task_log(f"开始{operation}任务: {len(selected_images)} 个文件到 {len(selected_targets)} 个目录")
+        
+        # 重置取消标志
+        self.task_cancelled = False
+        
+        # 提交异步任务
+        self.current_task = self.executor.submit(
+            self.process_images_worker, 
+            selected_images, selected_targets, images_path, labels_path, copy
+        )
+        
+        # 启动进度监控
+        self.monitor_task_progress()
+    
+    def process_images_worker(self, selected_images, selected_targets, images_path, labels_path, copy):
+        """异步处理图片的工作线程"""
+        operation = "复制" if copy else "移动"
+        total_operations = 0
+        failed_operations = []
+        
         try:
-            total_operations = 0
-            failed_operations = []
+            # 更新进度
+            self.root.after(0, lambda: self.progress_dialog.update_overall_progress(0, len(selected_images) * len(selected_targets), "创建目录结构..."))
             
             # 为每个目标目录创建images和labels子目录
-            for target_name, target_path in selected_targets:
+            for i, (target_name, target_path) in enumerate(selected_targets):
+                if self.task_cancelled or (self.progress_dialog and self.progress_dialog.is_cancelled()):
+                    return {"cancelled": True}
+                    
                 target_images_path = Path(target_path) / "images"
                 target_labels_path = Path(target_path) / "labels"
                 
                 try:
                     target_images_path.mkdir(exist_ok=True)
                     target_labels_path.mkdir(exist_ok=True)
+                    self.root.after(0, lambda name=target_name: self.progress_dialog.add_task_log(f"创建目录结构: {name}"))
                 except Exception as e:
                     failed_operations.append(f"创建目录结构 -> {target_name}: {str(e)}")
+                    self.root.after(0, lambda name=target_name, err=str(e): self.progress_dialog.add_task_log(f"创建目录失败: {name} - {err}"))
                     continue
             
             # 存储需要删除的原文件（仅用于移动操作）
             files_to_delete = []
             
-            for image_path in selected_images:
+            # 处理每个图片文件
+            total_files = len(selected_images)
+            for file_index, image_path in enumerate(selected_images):
+                if self.task_cancelled or (self.progress_dialog and self.progress_dialog.is_cancelled()):
+                    return {"cancelled": True}
+                
                 filename = os.path.basename(image_path)
-                # 获取对应的label文件名（假设扩展名为.txt）
                 label_filename = os.path.splitext(filename)[0] + ".txt"
-                label_path = labels_path / label_filename
+                label_path = images_path.parent / "labels" / label_filename
                 
                 # 记录需要删除的文件（移动操作时使用）
                 if not copy:
                     files_to_delete.append((image_path, label_path if label_path.exists() else None))
                 
-                # 先复制到所有目标目录
-                for target_name, target_path in selected_targets:
+                # 复制到所有目标目录
+                for target_index, (target_name, target_path) in enumerate(selected_targets):
+                    if self.task_cancelled or (self.progress_dialog and self.progress_dialog.is_cancelled()):
+                        return {"cancelled": True}
+                    
                     target_images_dir = Path(target_path) / "images"
                     target_labels_dir = Path(target_path) / "labels"
                     target_image_path = target_images_dir / filename
@@ -1350,12 +1497,30 @@ class ImageManager:
                             shutil.copy2(str(label_path), target_label_path)
                             total_operations += 1
                         
+                        # 更新进度
+                        current_progress = file_index * len(selected_targets) + target_index + 1
+                        total_progress = total_files * len(selected_targets)
+                        progress_text = f"{operation}中: {filename} -> {target_name} ({current_progress}/{total_progress})"
+                        
+                        self.root.after(0, lambda cp=current_progress, tp=total_progress, pt=progress_text: 
+                                       self.progress_dialog.update_overall_progress(cp, tp, pt))
+                        
+                        if target_index == 0:  # 只在第一个目标目录时记录日志，避免重复
+                            self.root.after(0, lambda fn=filename: self.progress_dialog.add_task_log(f"处理文件: {fn}"))
+                        
                     except Exception as e:
                         failed_operations.append(f"{filename} -> {target_name}: {str(e)}")
+                        self.root.after(0, lambda fn=filename, tn=target_name, err=str(e): 
+                                       self.progress_dialog.add_task_log(f"失败: {fn} -> {tn} - {err}"))
             
             # 如果是移动操作，删除原文件
-            if not copy:
+            if not copy and not (self.task_cancelled or (self.progress_dialog and self.progress_dialog.is_cancelled())):
+                self.root.after(0, lambda: self.progress_dialog.add_task_log("删除原文件..."))
+                
                 for image_path, label_path in files_to_delete:
+                    if self.task_cancelled or (self.progress_dialog and self.progress_dialog.is_cancelled()):
+                        return {"cancelled": True}
+                    
                     try:
                         # 删除图片文件
                         if os.path.exists(image_path):
@@ -1367,35 +1532,95 @@ class ImageManager:
                             
                     except Exception as e:
                         failed_operations.append(f"删除原文件 {os.path.basename(image_path)}: {str(e)}")
+                        self.root.after(0, lambda fn=os.path.basename(image_path), err=str(e): 
+                                       self.progress_dialog.add_task_log(f"删除失败: {fn} - {err}"))
             
-            # 显示结果
-            if failed_operations:
-                error_msg = f"部分操作失败:\n" + "\n".join(failed_operations[:5])
-                if len(failed_operations) > 5:
-                    error_msg += f"\n... 还有 {len(failed_operations) - 5} 个失败"
-                messagebox.showwarning("部分成功", 
-                    f"成功{operation}了 {total_operations} 次\n\n{error_msg}")
-                # 添加部分成功的操作日志
-                self.add_operation_log(f"{operation}操作部分成功: 成功 {total_operations} 次，失败 {len(failed_operations)} 次")
-            else:
-                messagebox.showinfo("成功", 
-                    f"成功{operation}了 {len(selected_images)} 个数据集文件到 {len(selected_targets)} 个目录")
-                # 添加成功的操作日志
-                self.add_operation_log(f"{operation}操作完成: 成功{operation}了 {len(selected_images)} 个数据集文件到 {len(selected_targets)} 个目录")
+            return {
+                "success": True,
+                "total_operations": total_operations,
+                "failed_operations": failed_operations,
+                "operation": operation,
+                "selected_images": selected_images,
+                "selected_targets": selected_targets,
+                "copy": copy
+            }
             
-            # 清除所有选中的复选框
-            for key, var in self.target_checkbox_vars.items():
-                if var.get():
-                    var.set(False)
-            
-            # 如果是移动操作，重新检测目录
-            if not copy:
-                self.detect_images()
-                
         except Exception as e:
-            messagebox.showerror("错误", f"{operation}过程中出现错误: {str(e)}")
-            # 添加错误的操作日志
-            self.add_operation_log(f"{operation}操作失败: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "operation": operation
+            }
+    
+    def monitor_task_progress(self):
+        """监控任务进度"""
+        if self.current_task and not self.current_task.done():
+            # 任务还在进行中，继续监控
+            self.root.after(100, self.monitor_task_progress)
+        elif self.current_task:
+            # 任务完成，处理结果
+            try:
+                result = self.current_task.result()
+                self.handle_task_completion(result)
+            except Exception as e:
+                self.handle_task_error(str(e))
+    
+    def handle_task_completion(self, result):
+        """处理任务完成"""
+        if result.get("cancelled"):
+            self.progress_dialog.add_task_log("任务已取消")
+            self.progress_dialog.task_completed()
+            self.add_operation_log("操作已取消")
+            return
+        
+        if not result.get("success"):
+            error = result.get("error", "未知错误")
+            self.progress_dialog.add_task_log(f"任务失败: {error}")
+            self.progress_dialog.task_completed()
+            messagebox.showerror("错误", f"{result.get('operation', '操作')}过程中出现错误: {error}")
+            self.add_operation_log(f"{result.get('operation', '操作')}失败: {error}")
+            return
+        
+        # 任务成功完成
+        operation = result["operation"]
+        total_operations = result["total_operations"]
+        failed_operations = result["failed_operations"]
+        selected_images = result["selected_images"]
+        selected_targets = result["selected_targets"]
+        copy = result["copy"]
+        
+        self.progress_dialog.add_task_log(f"任务完成: 总操作 {total_operations} 次")
+        self.progress_dialog.task_completed()
+        
+        # 显示结果
+        if failed_operations:
+            error_msg = f"部分操作失败:\n" + "\n".join(failed_operations[:5])
+            if len(failed_operations) > 5:
+                error_msg += f"\n... 还有 {len(failed_operations) - 5} 个失败"
+            messagebox.showwarning("部分成功", 
+                f"成功{operation}了 {total_operations} 次\n\n{error_msg}")
+            self.add_operation_log(f"{operation}操作部分成功: 成功 {total_operations} 次，失败 {len(failed_operations)} 次")
+        else:
+            messagebox.showinfo("成功", 
+                f"成功{operation}了 {len(selected_images)} 个数据集文件到 {len(selected_targets)} 个目录")
+            self.add_operation_log(f"{operation}操作完成: 成功{operation}了 {len(selected_images)} 个数据集文件到 {len(selected_targets)} 个目录")
+        
+        # 清除所有选中的复选框
+        for key, var in self.target_checkbox_vars.items():
+            if var.get():
+                var.set(False)
+        
+        # 如果是移动操作，重新检测目录
+        if not copy:
+            self.detect_images()
+    
+    def handle_task_error(self, error):
+        """处理任务错误"""
+        if self.progress_dialog:
+            self.progress_dialog.add_task_log(f"任务异常: {error}")
+            self.progress_dialog.task_completed()
+        messagebox.showerror("错误", f"任务执行异常: {error}")
+        self.add_operation_log(f"操作异常: {error}")
     
     def start_manual_detection(self):
         """开始手动检测模式"""
@@ -1567,6 +1792,12 @@ class ImageManager:
         
         # 停止窗口监控
         self.stop_window_monitoring()
+        
+        # 取消当前任务并关闭线程池
+        self.task_cancelled = True
+        if self.progress_dialog:
+            self.progress_dialog.close_dialog()
+        self.executor.shutdown(wait=False)
         
         self.root.destroy()
 
