@@ -31,12 +31,15 @@ jobs:
       run: python build.py
 
     - name: Rename executable with tag
+      shell: pwsh
       run: |
         $tag = "${{ github.ref_name }}"
-        $originalFile = "dist\ImageManager.exe"
-        $newFile = "dist\ImageManager-$tag.exe"
+        $distPath = Join-Path $PWD "dist"
+        $originalFile = Join-Path $distPath "ImageManager.exe"
+        $newFile = Join-Path $distPath "ImageManager-$tag.exe"
+
         if (Test-Path $originalFile) {
-          Rename-Item $originalFile $newFile
+          Rename-Item -Path $originalFile -NewName $newFile -Force
           Write-Host "Renamed $originalFile to $newFile"
         } else {
           Write-Host "Original file not found: $originalFile"
@@ -47,7 +50,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: image-dataset-manager-windows-${{ github.ref_name }}
-        path: dist/*.exe
+        path: dist/ImageManager-${{ github.ref_name }}.exe
         retention-days: 30
 
     - name: Get latest commit message
@@ -58,7 +61,7 @@ jobs:
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        files: dist/*.exe
+        files: dist/ImageManager-${{ github.ref_name }}.exe
         tag_name: ${{ github.ref_name }}
         release_name: Image Dataset Manager ${{ github.ref_name }}
         body: ${{ steps.commit.outputs.commit_msg }}
