@@ -30,10 +30,23 @@ jobs:
     - name: Build executable
       run: python build.py
 
+    - name: Rename executable with tag
+      run: |
+        $tag = "${{ github.ref_name }}"
+        $originalFile = "dist\ImageManager.exe"
+        $newFile = "dist\ImageManager-$tag.exe"
+        if (Test-Path $originalFile) {
+          Rename-Item $originalFile $newFile
+          Write-Host "Renamed $originalFile to $newFile"
+        } else {
+          Write-Host "Original file not found: $originalFile"
+          exit 1
+        }
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: image-dataset-manager-windows
+        name: image-dataset-manager-windows-${{ github.ref_name }}
         path: dist/*.exe
         retention-days: 30
 
