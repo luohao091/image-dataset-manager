@@ -4,3 +4,4 @@ psutil>=5.8.0
 watchdog>=2.1.0
 pyinstaller>=5.0.0
 pywin32>=306; sys_platform == "win32"
+paramiko>=2.9.0  # SSH连接支持

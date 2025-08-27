@@ -23,6 +23,12 @@ from watchdog.events import FileSystemEventHandler
 import queue
 from concurrent.futures import ThreadPoolExecutor
 try:
+    import paramiko
+    PARAMIKO_AVAILABLE = True
+except ImportError:
+    PARAMIKO_AVAILABLE = False
+    print("注意: paramiko库未安装，SSH服务器模式将被禁用。如需完整功能，请运行: pip install paramiko")
+try:
     import win32gui
     import win32process
     WIN32_AVAILABLE = True
@@ -175,6 +181,26 @@ class ImageManager:
         self.current_task = None
         self.task_cancelled = False
         
+        # 模式相关变量
+        self.operation_mode = tk.StringVar(value="windows")  # windows 或 server
+        
+        # SSH服务器配置
+        self.ssh_config = {
+            "host": "",
+            "username": "",
+            "password": "",
+            "share_path": "/data/share"  # 服务器上share目录的绝对路径
+        }
+        self.ssh_client = None
+        self.ssh_connection_time = None  # 连接建立时间
+        self.ssh_last_activity = None    # 最后活动时间
+        self.ssh_connection_timeout = 7200  # 连接超时时间（秒），增加到2小时
+        self.ssh_directory_cache = set()  # 已创建目录的缓存
+        self.ssh_connection_pool = {}  # SSH连接池
+        self.max_pool_size = 3  # 最大连接池大小
+        self.connection_reuse_count = 0  # 连接复用计数
+        self.max_reuse_count = 1000  # 最大复用次数，超过后重建连接
+        
         # 加载配置
         self.load_config()
         
@@ -183,6 +209,9 @@ class ImageManager:
         
         # 创建界面
         self.create_widgets()
+        
+        # 更新模式显示
+        self.update_mode_display()
         
         # 绑定关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -195,6 +224,8 @@ class ImageManager:
         # 配置菜单
         config_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="配置", menu=config_menu)
+        config_menu.add_command(label="操作模式配置", command=self.open_mode_config)
+        config_menu.add_separator()
         config_menu.add_command(label="目标目录配置", command=self.open_target_config)
         config_menu.add_separator()
         config_menu.add_command(label="退出", command=self.on_closing)
@@ -207,6 +238,14 @@ class ImageManager:
                     config = json.load(f)
                     self.target_directories = config.get('target_directories', {})
                     self.scenarios = config.get('scenarios', {})
+                    
+                    # 加载操作模式
+                    mode = config.get('operation_mode', 'windows')
+                    self.operation_mode.set(mode)
+                    
+                    # 加载SSH配置
+                    ssh_config = config.get('ssh_config', {})
+                    self.ssh_config.update(ssh_config)
                     
                     # 如果有旧格式的target_directories，转换为新格式
                     if self.target_directories and not self.scenarios:
@@ -248,13 +287,546 @@ class ImageManager:
         try:
             config = {
                 'target_directories': self.target_directories,  # 保持兼容性
-                'scenarios': self.scenarios
+                'scenarios': self.scenarios,
+                'operation_mode': self.operation_mode.get(),
+                'ssh_config': self.ssh_config
             }
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
         except Exception as e:
             messagebox.showerror("错误", f"保存配置文件失败: {e}")
     
+    def open_mode_config(self):
+        """打开操作模式配置对话框"""
+        mode_window = tk.Toplevel(self.root)
+        mode_window.title("操作模式配置")
+        mode_window.geometry("600x500")
+        mode_window.resizable(True, True)  # 允许用户调整大小
+        mode_window.minsize(500, 400)  # 设置最小尺寸
+        mode_window.transient(self.root)
+        mode_window.grab_set()
+        
+        # 居中显示对话框
+        mode_window.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (600 // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (500 // 2)
+        mode_window.geometry(f"600x500+{x}+{y}")
+        
+        # 主框架
+        main_frame = ttk.Frame(mode_window, padding="15")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 模式选择框架
+        mode_frame = ttk.LabelFrame(main_frame, text="操作模式选择", padding="10")
+        mode_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        # 模式选择单选按钮
+        ttk.Radiobutton(mode_frame, text="Windows本地模式", 
+                       variable=self.operation_mode, value="windows").pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(mode_frame, text="SSH服务器模式", 
+                       variable=self.operation_mode, value="server").pack(anchor=tk.W, pady=2)
+        
+        # SSH配置框架
+        ssh_frame = ttk.LabelFrame(main_frame, text="SSH服务器配置", padding="10")
+        ssh_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+        
+        # SSH配置变量
+        ssh_host = tk.StringVar(value=self.ssh_config.get("host", ""))
+        ssh_username = tk.StringVar(value=self.ssh_config.get("username", ""))
+        ssh_password = tk.StringVar(value=self.ssh_config.get("password", ""))
+        ssh_share_path = tk.StringVar(value=self.ssh_config.get("share_path", "/data/share"))
+        
+        # SSH主机
+        ttk.Label(ssh_frame, text="SSH主机:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(ssh_frame, textvariable=ssh_host, width=40).grid(row=0, column=1, sticky=tk.W+tk.E, pady=5, padx=(10, 0))
+        
+        # SSH用户名
+        ttk.Label(ssh_frame, text="用户名:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(ssh_frame, textvariable=ssh_username, width=40).grid(row=1, column=1, sticky=tk.W+tk.E, pady=5, padx=(10, 0))
+        
+        # SSH密码
+        ttk.Label(ssh_frame, text="密码:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(ssh_frame, textvariable=ssh_password, show="*", width=40).grid(row=2, column=1, sticky=tk.W+tk.E, pady=5, padx=(10, 0))
+        
+        # 服务器share目录路径
+        ttk.Label(ssh_frame, text="服务器share目录:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(ssh_frame, textvariable=ssh_share_path, width=40).grid(row=3, column=1, sticky=tk.W+tk.E, pady=5, padx=(10, 0))
+        
+        # 配置网格权重
+        ssh_frame.columnconfigure(1, weight=1)
+        
+        # 说明文本
+        info_text = "说明:\n" + \
+                   "• Windows本地模式: 直接在本地文件系统进行操作\n" + \
+                   "• SSH服务器模式: 通过SSH连接到远程服务器执行操作\n" + \
+                   "• 服务器share目录: 服务器上共享目录的绝对路径\n" + \
+                   "• 例如: /data/share 对应 \\\\192.168.11.189\\share"
+        
+        info_label = ttk.Label(ssh_frame, text=info_text, foreground="gray", font=("Arial", 8))
+        info_label.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
+        
+        # 按钮框架
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X)
+        
+        def test_ssh_connection():
+            """测试SSH连接"""
+            if not PARAMIKO_AVAILABLE:
+                messagebox.showerror("错误", "paramiko库未安装，无法使用SSH功能")
+                return
+                
+            host = ssh_host.get().strip()
+            username = ssh_username.get().strip()
+            password = ssh_password.get()
+            
+            if not all([host, username, password]):
+                messagebox.showwarning("警告", "请填写完整的SSH连接信息")
+                return
+            
+            try:
+                # 创建SSH客户端测试连接
+                test_client = paramiko.SSHClient()
+                test_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                test_client.connect(hostname=host, username=username, password=password, timeout=10)
+                test_client.close()
+                messagebox.showinfo("成功", "SSH连接测试成功！")
+            except Exception as e:
+                messagebox.showerror("连接失败", f"SSH连接测试失败:\n{str(e)}")
+        
+        def save_config_only():
+            """仅保存配置，不关闭对话框"""
+            # 获取当前选择的操作模式
+            selected_mode = self.operation_mode.get()
+            
+            # 如果选择服务器模式，需要校验SSH连接
+            if selected_mode == "server":
+                if not PARAMIKO_AVAILABLE:
+                    messagebox.showerror("错误", "paramiko库未安装，无法使用SSH功能")
+                    return
+                    
+                host = ssh_host.get().strip()
+                username = ssh_username.get().strip()
+                password = ssh_password.get()
+                share_path = ssh_share_path.get().strip()
+                
+                # 检查必填字段
+                if not all([host, username, password, share_path]):
+                    messagebox.showwarning("警告", "服务器模式下请填写完整的SSH连接信息和共享路径")
+                    return
+                
+                # 测试SSH连接
+                try:
+                    test_client = paramiko.SSHClient()
+                    test_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    test_client.connect(hostname=host, username=username, password=password, timeout=10)
+                    
+                    # 测试共享路径是否存在
+                    stdin, stdout, stderr = test_client.exec_command(f'test -d "{share_path}" && echo "exists" || echo "not_exists"')
+                    result = stdout.read().decode().strip()
+                    
+                    if result != "exists":
+                        test_client.close()
+                        messagebox.showerror("路径错误", f"服务器上的共享路径不存在: {share_path}")
+                        return
+                    
+                    test_client.close()
+                    
+                except Exception as e:
+                    messagebox.showerror("连接失败", f"SSH连接校验失败:\n{str(e)}\n\n请检查连接信息后重试")
+                    return
+            
+            # 更新SSH配置
+            self.ssh_config["host"] = ssh_host.get().strip()
+            self.ssh_config["username"] = ssh_username.get().strip()
+            self.ssh_config["password"] = ssh_password.get()
+            self.ssh_config["share_path"] = ssh_share_path.get().strip()
+            
+            # 保存配置到文件
+            self.save_config()
+            
+            # 更新模式显示
+            self.update_mode_display()
+            
+            # 显示保存成功信息
+            if selected_mode == "server":
+                messagebox.showinfo("成功", f"配置已保存\n当前模式: SSH服务器模式\n服务器: {ssh_host.get().strip()}")
+            else:
+                messagebox.showinfo("成功", "配置已保存\n当前模式: Windows本地模式")
+        
+        def save_and_close():
+            """保存配置并关闭对话框"""
+            # 先保存配置
+            save_config_only()
+            
+            # 关闭SSH连接（如果存在）
+            if self.ssh_client:
+                try:
+                    self.ssh_client.close()
+                except:
+                    pass
+                self.ssh_client = None
+            
+            mode_window.destroy()
+        
+        # 按钮 - 使用网格布局避免重叠
+        ttk.Button(button_frame, text="测试SSH连接", command=test_ssh_connection).grid(row=0, column=0, padx=(0, 10), pady=5)
+        ttk.Button(button_frame, text="保存配置", command=save_config_only).grid(row=0, column=1, padx=(0, 10), pady=5)
+        ttk.Button(button_frame, text="保存并关闭", command=save_and_close).grid(row=0, column=2, padx=(0, 10), pady=5)
+        ttk.Button(button_frame, text="取消", command=mode_window.destroy).grid(row=0, column=3, padx=(0, 0), pady=5)
+        
+        # 配置按钮框架的列权重，使按钮均匀分布
+        for i in range(4):
+            button_frame.columnconfigure(i, weight=1)
+    
+    def convert_smb_to_linux_path(self, smb_path):
+        """将SMB路径转换为Linux绝对路径
+        
+        Args:
+            smb_path: SMB路径，如 \\\\192.168.11.189\\share\\数据\\测试集\\coal-3218
+            
+        Returns:
+            转换后的Linux路径，如 /data/share/数据/测试集/coal-3218
+        """
+        if not smb_path or not isinstance(smb_path, str):
+            return smb_path
+            
+        # 移除开头的反斜杠并分割路径
+        path_clean = smb_path.strip().replace('\\', '/')
+        
+        # 分割路径组件
+        path_parts = [part for part in path_clean.split('/') if part]
+        
+        if len(path_parts) < 2:
+            return smb_path  # 路径格式不正确，返回原路径
+            
+        # 第一部分是IP地址，第二部分是share，从第三部分开始是实际路径
+        if len(path_parts) >= 2 and path_parts[1] == 'share':
+            # 获取服务器share目录的绝对路径
+            server_share_path = self.ssh_config.get('share_path', '/data/share')
+            
+            # 构建Linux路径：服务器share路径 + 相对路径
+            if len(path_parts) > 2:
+                relative_path = '/'.join(path_parts[2:])
+                linux_path = f"{server_share_path.rstrip('/')}/{relative_path}"
+            else:
+                linux_path = server_share_path
+                
+            return linux_path
+        
+        return smb_path  # 无法转换，返回原路径
+    
+    def convert_windows_to_linux_path(self, windows_path):
+        """将Windows路径转换为Linux路径（用于服务器模式）
+        
+        Args:
+            windows_path: Windows路径，可能是本地路径或SMB路径
+            
+        Returns:
+            转换后的Linux路径
+        """
+        if not windows_path or not isinstance(windows_path, str):
+            return windows_path
+            
+        # 如果是SMB路径（以\\开头），使用SMB转换逻辑
+        if windows_path.startswith('\\\\'):
+            return self.convert_smb_to_linux_path(windows_path)
+        
+        # 如果是普通Windows路径，直接转换反斜杠为正斜杠
+        linux_path = windows_path.replace('\\', '/')
+        
+        # 处理Windows驱动器路径（如C:\path -> /mnt/c/path）
+        if len(linux_path) >= 2 and linux_path[1] == ':':
+            drive_letter = linux_path[0].lower()
+            rest_path = linux_path[2:].lstrip('/')
+            linux_path = f"/mnt/{drive_letter}/{rest_path}" if rest_path else f"/mnt/{drive_letter}"
+            
+        return linux_path
+    
+    def get_effective_path(self, path):
+        """根据当前操作模式获取有效路径
+        
+        Args:
+            path: 原始路径
+            
+        Returns:
+            根据操作模式转换后的有效路径
+        """
+        if self.operation_mode.get() == "server":
+            return self.convert_windows_to_linux_path(path)
+        else:
+             return path  # Windows模式直接返回原路径
+     
+    def get_ssh_client(self, retry_count=3):
+        """获取SSH客户端连接（支持持久连接和自动重连）
+        
+        Args:
+            retry_count: 重试次数
+            
+        Returns:
+            SSH客户端对象，如果连接失败返回None
+        """
+        if not PARAMIKO_AVAILABLE:
+            raise Exception("paramiko库未安装，无法使用SSH功能")
+        
+        current_time = time.time()
+        
+        # 检查现有连接是否有效
+        if self.ssh_client is not None:
+            # 检查连接是否超时
+            if (self.ssh_connection_time and 
+                current_time - self.ssh_connection_time > self.ssh_connection_timeout):
+                self.close_ssh_connection()
+            # 检查连接复用次数是否超限
+            elif self.connection_reuse_count >= self.max_reuse_count:
+                print(f"连接复用次数达到上限({self.max_reuse_count})，重建连接")
+                self.close_ssh_connection()
+            # 检查连接是否仍然活跃
+            elif not self._is_ssh_connection_alive():
+                self.close_ssh_connection()
+        
+        # 如果没有有效连接，创建新连接（带重试机制）
+        if self.ssh_client is None:
+            last_error = None
+            
+            for attempt in range(retry_count):
+                try:
+                    self.ssh_client = paramiko.SSHClient()
+                    self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    
+                    host = self.ssh_config.get("host", "")
+                    username = self.ssh_config.get("username", "")
+                    password = self.ssh_config.get("password", "")
+                    
+                    if not all([host, username, password]):
+                        raise Exception("SSH配置信息不完整")
+                    
+                    # 增加连接参数以提高稳定性
+                    self.ssh_client.connect(
+                        hostname=host,
+                        username=username,
+                        password=password,
+                        timeout=60,  # 增加连接超时
+                        banner_timeout=60,  # 增加banner超时
+                        auth_timeout=60,  # 增加认证超时
+                        look_for_keys=False,
+                        allow_agent=False,
+                        compress=True,  # 启用压缩减少网络负载
+                        sock=None,
+                        gss_auth=False,
+                        gss_kex=False,
+                        gss_deleg_creds=True,
+                        gss_host=None
+                    )
+                    
+                    # 设置TCP keepalive和socket选项以保持连接稳定
+                    transport = self.ssh_client.get_transport()
+                    if transport:
+                        # 设置更长的keepalive间隔，减少服务器压力
+                        transport.set_keepalive(120)  # 每2分钟发送keepalive
+                        
+                        # 设置socket选项
+                        sock = transport.sock
+                        if sock:
+                            import socket
+                            # 启用TCP keepalive
+                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                            # 设置keepalive参数（Windows）
+                            if hasattr(socket, 'TCP_KEEPIDLE'):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 120)
+                            if hasattr(socket, 'TCP_KEEPINTVL'):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30)
+                            if hasattr(socket, 'TCP_KEEPCNT'):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                            # 设置接收缓冲区大小
+                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                            # 设置发送缓冲区大小
+                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+                            # 禁用Nagle算法以减少延迟
+                            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    
+                    # 记录连接时间
+                    self.ssh_connection_time = current_time
+                    self.ssh_last_activity = current_time
+                    self.connection_reuse_count = 0  # 重置复用计数
+                    
+                    print(f"SSH连接建立成功，主机: {host}")
+                    
+                    # 连接成功，跳出重试循环
+                    break
+                    
+                except Exception as e:
+                    last_error = e
+                    if self.ssh_client:
+                        try:
+                            self.ssh_client.close()
+                        except:
+                            pass
+                        self.ssh_client = None
+                        self.ssh_connection_time = None
+                        self.ssh_last_activity = None
+                    
+                    # 如果不是最后一次尝试，等待后重试
+                    if attempt < retry_count - 1:
+                        wait_time = (attempt + 1) * 2  # 指数退避：2, 4, 6秒
+                        time.sleep(wait_time)
+                    
+            # 如果所有重试都失败，抛出最后的错误
+            if self.ssh_client is None and last_error:
+                raise Exception(f"SSH连接失败（重试{retry_count}次后）: {str(last_error)}")
+        
+        # 更新最后活动时间和复用计数
+        self.ssh_last_activity = current_time
+        self.connection_reuse_count += 1
+        return self.ssh_client
+     
+    def execute_ssh_command(self, command, retry_count=2):
+         """执行SSH命令（带重试机制）
+         
+         Args:
+             command: 要执行的命令
+             retry_count: 重试次数
+             
+         Returns:
+             tuple: (stdout, stderr, exit_code)
+         """
+         last_error = None
+         
+         for attempt in range(retry_count + 1):
+             try:
+                 ssh_client = self.get_ssh_client()
+                 
+                 # 设置更长的命令超时时间，适应大批量操作
+                 stdin, stdout, stderr = ssh_client.exec_command(command, timeout=600)
+                 
+                 # 等待命令执行完成
+                 exit_code = stdout.channel.recv_exit_status()
+                 
+                 stdout_text = stdout.read().decode('utf-8')
+                 stderr_text = stderr.read().decode('utf-8')
+                 
+                 return stdout_text, stderr_text, exit_code
+                 
+             except Exception as e:
+                 last_error = e
+                 error_str = str(e).lower()
+                 
+                 # 检查是否是连接相关的错误
+                 connection_errors = [
+                     'connection reset',
+                     'connection closed',
+                     'connection lost',
+                     'broken pipe',
+                     'socket is closed',
+                     '远程主机强迫关闭',
+                     'connection aborted',
+                     'connection refused'
+                 ]
+                 
+                 is_connection_error = any(err in error_str for err in connection_errors)
+                 
+                 if is_connection_error and attempt < retry_count:
+                     # 连接错误，关闭当前连接并重试
+                     self.close_ssh_connection()
+                     wait_time = (attempt + 1) * 3  # 指数退避：3, 6秒
+                     time.sleep(wait_time)
+                     continue
+                 else:
+                     # 非连接错误或已达到最大重试次数
+                     break
+         
+         # 抛出最后的错误
+         raise Exception(f"SSH命令执行失败（重试{retry_count}次后）: {str(last_error)}")
+     
+    def _is_ssh_connection_alive(self):
+        """检查SSH连接是否仍然活跃
+        
+        Returns:
+            bool: 连接是否活跃
+        """
+        if not self.ssh_client:
+            return False
+        
+        try:
+            # 发送一个简单的命令来测试连接
+            transport = self.ssh_client.get_transport()
+            if transport is None or not transport.is_active():
+                return False
+            
+            # 执行一个轻量级命令
+            stdin, stdout, stderr = self.ssh_client.exec_command('echo test', timeout=5)
+            result = stdout.read().decode('utf-8').strip()
+            return result == 'test'
+        except:
+            return False
+    
+    def close_ssh_connection(self):
+        """关闭SSH连接并清理相关状态"""
+        if self.ssh_client:
+            try:
+                print(f"关闭SSH连接，复用次数: {self.connection_reuse_count}")
+                self.ssh_client.close()
+            except:
+                pass
+            self.ssh_client = None
+            self.ssh_connection_time = None
+            self.ssh_last_activity = None
+            self.connection_reuse_count = 0  # 重置复用计数
+            # 清理目录缓存（连接断开后重新建立时需要重新检查）
+            self.ssh_directory_cache.clear()
+     
+    def test_ssh_path_access(self, path):
+         """测试SSH路径访问
+         
+         Args:
+             path: 要测试的Linux路径
+             
+         Returns:
+             bool: 路径是否可访问
+         """
+         try:
+             command = f"test -e '{path}' && echo 'exists' || echo 'not_exists'"
+             stdout, stderr, exit_code = self.execute_ssh_command(command)
+             return stdout.strip() == 'exists'
+         except:
+             return False
+     
+    def create_ssh_directory(self, path):
+        """通过SSH创建目录（带缓存优化）
+        
+        Args:
+            path: 要创建的目录路径
+            
+        Returns:
+            bool: 是否创建成功
+        """
+        # 检查缓存，如果已经创建过则直接返回成功
+        if path in self.ssh_directory_cache:
+            return True
+        
+        try:
+            # 首先检查目录是否已存在
+            check_command = f"test -d '{path}' && echo 'exists' || echo 'not_exists'"
+            stdout, stderr, exit_code = self.execute_ssh_command(check_command)
+            
+            if exit_code == 0 and stdout.strip() == 'exists':
+                # 目录已存在，添加到缓存
+                self.ssh_directory_cache.add(path)
+                return True
+            
+            # 目录不存在，创建目录
+            create_command = f"mkdir -p '{path}'"
+            stdout, stderr, exit_code = self.execute_ssh_command(create_command)
+            
+            if exit_code == 0:
+                # 创建成功，添加到缓存
+                self.ssh_directory_cache.add(path)
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            return False
+     
     def open_target_config(self):
         """打开场景和子目录配置对话框"""
         config_window = tk.Toplevel(self.root)
@@ -612,6 +1184,11 @@ class ImageManager:
         self.status_label = ttk.Label(main_frame, text="请选择数据集目录")
         self.status_label.grid(row=2, column=0, columnspan=3, pady=5)
         
+        # 操作模式显示
+        self.mode_label = ttk.Label(main_frame, text="", foreground='blue', font=('Arial', 9))
+        self.mode_label.grid(row=2, column=2, sticky=tk.E, pady=5)
+        self.update_mode_display()
+        
         # 移除图片列表展示区域以拓宽目标目录展示
         
         # 控制按钮框架
@@ -740,6 +1317,15 @@ class ImageManager:
         
         # 初始化目标目录复选框
         self.update_target_checkboxes()
+    
+    def update_mode_display(self):
+        """更新操作模式显示"""
+        mode = self.operation_mode.get()
+        if mode == "server":
+            host = self.ssh_config.get("host", "未配置")
+            self.mode_label.config(text=f"服务器模式: {host}")
+        else:
+            self.mode_label.config(text="Windows本地模式")
         
     def add_operation_log(self, message):
         """添加操作日志"""
@@ -952,21 +1538,86 @@ class ImageManager:
             self.image_files = []
             
             # 检查数据集目录结构
-            dataset_path = Path(self.source_dir.get())
-            images_path = dataset_path / "images"
-            labels_path = dataset_path / "labels"
+            dataset_path = self.source_dir.get()
             
-            if not images_path.exists():
-                self.root.after(0, lambda: self.status_label.config(text="错误: 数据集目录下未找到images子目录"))
-                return
-            
-            if not labels_path.exists():
-                self.root.after(0, lambda: self.status_label.config(text="警告: 数据集目录下未找到labels子目录"))
-            
-            # 扫描images目录中的图片文件
-            for file_path in images_path.iterdir():
-                if file_path.is_file() and file_path.suffix.lower() in image_extensions:
-                    self.image_files.append(str(file_path))
+            if self.operation_mode.get() == "server":
+                # 服务器模式：转换为服务器路径并通过SSH检查
+                server_dataset_path = self.convert_smb_to_linux_path(dataset_path)
+                server_images_path = f"{server_dataset_path}/images"
+                server_labels_path = f"{server_dataset_path}/labels"
+                
+                # 检查SSH连接
+                try:
+                    ssh_client = self.get_ssh_client()
+                    if not ssh_client:
+                        error_msg = "无法建立SSH连接"
+                        self.root.after(0, lambda: self.status_label.config(text=f"错误: {error_msg}"))
+                        return
+                except Exception as e:
+                    error_msg = f"SSH连接失败: {str(e)}"
+                    self.root.after(0, lambda: self.status_label.config(text=f"错误: {error_msg}"))
+                    return
+                
+                # 检查images目录是否存在
+                stdout, stderr, exit_code = self.execute_ssh_command(f"test -d '{server_images_path}' && echo 'exists' || echo 'not_exists'")
+                images_exists = stdout.strip() == 'exists'
+                
+                if not images_exists:
+                    self.root.after(0, lambda: self.status_label.config(text="错误: 数据集目录下未找到images子目录"))
+                    return
+                
+                # 检查labels目录是否存在
+                stdout, stderr, exit_code = self.execute_ssh_command(f"test -d '{server_labels_path}' && echo 'exists' || echo 'not_exists'")
+                labels_exists = stdout.strip() == 'exists'
+                
+                if not labels_exists:
+                    self.root.after(0, lambda: self.status_label.config(text="警告: 数据集目录下未找到labels子目录"))
+                
+                # 更新状态为正在扫描
+                self.root.after(0, lambda: self.status_label.config(text="正在扫描图片文件..."))
+                
+                # 扫描images目录中的图片文件 - 优化版本，减少输出
+                find_command = f"find '{server_images_path}' -maxdepth 1 -type f \\( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.bmp' -o -iname '*.gif' -o -iname '*.tiff' -o -iname '*.webp' \\) | wc -l"
+                
+                # 先获取文件数量
+                stdout, stderr, exit_code = self.execute_ssh_command(find_command)
+                file_count = int(stdout.strip()) if stdout.strip().isdigit() else 0
+                
+                if file_count > 0:
+                    # 如果有文件，再获取文件列表
+                    find_command = f"find '{server_images_path}' -maxdepth 1 -type f \\( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.bmp' -o -iname '*.gif' -o -iname '*.tiff' -o -iname '*.webp' \\) | sort"
+                    stdout, stderr, exit_code = self.execute_ssh_command(find_command)
+                    
+                    if exit_code == 0:
+                        server_files = stdout.strip().split('\n') if stdout.strip() else []
+                        
+                        # 批量转换路径，避免逐个日志输出
+                        for server_file in server_files:
+                            if server_file.strip():  # 跳过空行
+                                relative_path = server_file.replace(server_dataset_path, "").lstrip("/")
+                                local_file_path = os.path.join(dataset_path, relative_path).replace("/", "\\")
+                                self.image_files.append(local_file_path)
+                    else:
+                        self.add_operation_log(f"[服务器模式] 文件扫描失败: {stderr.strip()}")
+                else:
+                    self.add_operation_log(f"[服务器模式] 未找到任何图片文件")
+            else:
+                # 本地模式：使用原有逻辑
+                dataset_path_obj = Path(dataset_path)
+                images_path = dataset_path_obj / "images"
+                labels_path = dataset_path_obj / "labels"
+                
+                if not images_path.exists():
+                    self.root.after(0, lambda: self.status_label.config(text="错误: 数据集目录下未找到images子目录"))
+                    return
+                
+                if not labels_path.exists():
+                    self.root.after(0, lambda: self.status_label.config(text="警告: 数据集目录下未找到labels子目录"))
+                
+                # 扫描images目录中的图片文件
+                for file_path in images_path.iterdir():
+                    if file_path.is_file() and file_path.suffix.lower() in image_extensions:
+                        self.image_files.append(str(file_path))
             
             # 按文件名排序
             self.image_files.sort(key=lambda x: self.natural_sort_key(os.path.basename(x)))
@@ -982,13 +1633,14 @@ class ImageManager:
             else:
                 status_text += " (无序)"
             
-            # 添加检测完成日志
-            self.add_operation_log(f"检测完成: 找到 {len(self.image_files)} 个图片文件 {('(有序)' if is_ordered else '(无序)')}")
-            
+            # 添加简化的检测完成日志
+            mode_text = "服务器" if self.operation_mode.get() == "server" else "本地"
+            self.add_operation_log(f"[{mode_text}模式] 检测完成: 找到 {len(self.image_files)} 个图片文件")
             self.root.after(0, lambda: self.status_label.config(text=status_text))
             
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("错误", f"检测过程中出现错误: {str(e)}"))
+            error_msg = str(e)
+            self.root.after(0, lambda: messagebox.showerror("错误", f"检测过程中出现错误: {error_msg}"))
     
     def natural_sort_key(self, text):
         """自然排序键函数"""
@@ -1435,6 +2087,14 @@ class ImageManager:
     
     def process_images_worker(self, selected_images, selected_targets, images_path, labels_path, copy):
         """异步处理图片的工作线程"""
+        # 根据操作模式选择不同的处理方法
+        if self.operation_mode.get() == "server":
+            return self.process_images_worker_ssh(selected_images, selected_targets, images_path, labels_path, copy)
+        else:
+            return self.process_images_worker_local(selected_images, selected_targets, images_path, labels_path, copy)
+    
+    def process_images_worker_local(self, selected_images, selected_targets, images_path, labels_path, copy):
+        """Windows本地模式的图片处理工作线程"""
         operation = "复制" if copy else "移动"
         total_operations = 0
         failed_operations = []
@@ -1546,6 +2206,768 @@ class ImageManager:
             }
             
         except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "operation": operation
+            }
+    
+    def execute_batch_ssh_operations(self, operations, operation_type="copy", max_workers=4, atomic=True):
+        """批量执行SSH操作，支持并行处理和数据一致性保证
+        
+        Args:
+            operations: 操作列表，每个元素为 (source_path, target_path, file_type)
+            operation_type: 操作类型 'copy' 或 'move'
+            max_workers: 最大并行工作线程数
+            atomic: 是否启用原子性操作（事务性保证）
+            
+        Returns:
+            dict: 操作结果
+        """
+        if not operations:
+            return {"success": True, "message": "没有需要处理的操作"}
+        
+        # 预先检查SSH连接
+        try:
+            ssh_client = self.get_ssh_client()
+            if not ssh_client:
+                return {"success": False, "error": "无法建立SSH连接"}
+        except Exception as e:
+            return {"success": False, "error": f"SSH连接失败: {str(e)}"}
+        
+        if atomic:
+            # 使用事务性操作保证原子性
+            return self._execute_atomic_operations(operations, operation_type, max_workers)
+        else:
+            # 根据操作数量选择处理策略
+            if len(operations) <= 10:
+                # 少量文件使用批量脚本
+                return self._execute_batch_script(operations, operation_type)
+            else:
+                # 大量文件使用并行处理
+                return self._execute_parallel_operations(operations, operation_type, max_workers)
+    def _execute_batch_script(self, operations, operation_type="copy"):
+        """使用批量脚本执行SSH操作（增强版）"""
+        script_path = None
+        backup_script_path = None
+        
+        try:
+            # 分批处理大量操作，避免脚本过大
+            batch_size = 100
+            total_success = 0
+            total_failed = 0
+            
+            for i in range(0, len(operations), batch_size):
+                batch_operations = operations[i:i + batch_size]
+                
+                # 创建临时脚本文件路径
+                script_path = f"/tmp/batch_operations_{int(time.time())}_{i}.sh"
+                backup_script_path = f"/tmp/backup_operations_{int(time.time())}_{i}.sh"
+                
+                # 构建批量操作脚本
+                script_lines = ["#!/bin/bash", "set -e"]
+                backup_lines = ["#!/bin/bash", "set -e"]
+                
+                # 为移动操作准备备份脚本（用于回滚）
+                if operation_type == "move":
+                    script_lines.append("# 批量移动操作")
+                    for source_path, target_path, file_type in batch_operations:
+                        script_lines.append(f"mv '{source_path}' '{target_path}'")
+                        # 备份脚本用于回滚
+                        backup_lines.append(f"mv '{target_path}' '{source_path}'")
+                else:
+                    script_lines.append("# 批量复制操作")
+                    for source_path, target_path, file_type in batch_operations:
+                        script_lines.append(f"cp '{source_path}' '{target_path}'")
+                
+                script_content = "\n".join(script_lines)
+                backup_content = "\n".join(backup_lines)
+                
+                # 使用SFTP上传脚本文件，避免参数列表过长问题
+                try:
+                    sftp = ssh_client.open_sftp()
+                    
+                    # 上传主脚本
+                    with sftp.open(script_path, 'w') as f:
+                        f.write(script_content)
+                    
+                    # 如果是移动操作，也上传备份脚本
+                    if operation_type == "move":
+                        with sftp.open(backup_script_path, 'w') as f:
+                            f.write(backup_content)
+                    
+                    sftp.close()
+                    print(f"脚本文件上传成功: {script_path}")
+                    
+                except Exception as e:
+                    return {"success": False, "error": f"SFTP脚本上传失败: {str(e)}"}
+                
+                # 设置脚本执行权限
+                chmod_cmd = f"chmod +x '{script_path}'"
+                if operation_type == "move":
+                    chmod_cmd += f" && chmod +x '{backup_script_path}'"
+                
+                stdout, stderr, exit_code = self.execute_ssh_command(chmod_cmd, retry_count=2)
+                if exit_code != 0:
+                    return {"success": False, "error": f"设置脚本权限失败: {stderr}"}
+                
+                # 执行批量操作脚本（带重试）
+                exec_cmd = f"bash '{script_path}'"
+                stdout, stderr, exit_code = self.execute_ssh_command(exec_cmd, retry_count=2)
+            
+                # 清理脚本文件
+                cleanup_cmd = f"rm -f '{script_path}'"
+                if operation_type == "move":
+                    cleanup_cmd += f" '{backup_script_path}'"
+                try:
+                    self.execute_ssh_command(cleanup_cmd)
+                except:
+                    pass  # 清理失败不影响主要操作
+                
+                if exit_code == 0:
+                    total_success += len(batch_operations)
+                else:
+                    total_failed += len(batch_operations)
+                    # 如果是移动操作且失败，尝试回滚
+                    if operation_type == "move":
+                        try:
+                            rollback_cmd = f"bash '{backup_script_path}'"
+                            self.execute_ssh_command(rollback_cmd)
+                        except:
+                            pass  # 回滚失败记录但不中断
+                    
+                    return {
+                        "success": False,
+                        "error": f"批量操作失败: {stderr}",
+                        "operations_count": len(batch_operations),
+                        "batch_index": i
+                    }
+            
+            return {
+                "success": True,
+                "operations_count": total_success,
+                "total_batches": (len(operations) + batch_size - 1) // batch_size
+            }
+                
+        except Exception as e:
+            # 确保清理临时文件
+            if script_path:
+                try:
+                    cleanup_cmd = f"rm -f '{script_path}'"
+                    if backup_script_path:
+                        cleanup_cmd += f" '{backup_script_path}'"
+                    self.execute_ssh_command(cleanup_cmd)
+                except:
+                    pass
+            return {"success": False, "error": f"批量操作异常: {str(e)}"}
+    
+    def _execute_parallel_operations(self, operations, operation_type="copy", max_workers=4):
+        """并行执行SSH操作
+        
+        Args:
+            operations: 操作列表
+            operation_type: 操作类型
+            max_workers: 最大并行工作线程数
+            
+        Returns:
+            dict: 操作结果
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        try:
+            # 检查SSH连接
+            ssh_client = self.get_ssh_client()
+            if not ssh_client:
+                return {"success": False, "error": "无法建立SSH连接"}
+            
+            # 线程安全的结果收集
+            results = []
+            results_lock = threading.Lock()
+            failed_operations = []
+            
+            def execute_single_operation(operation):
+                """执行单个文件操作"""
+                source_path, target_path, file_type = operation
+                try:
+                    # 为每个线程获取独立的SSH客户端
+                    thread_ssh = self.get_ssh_client()
+                    if not thread_ssh:
+                        return {"success": False, "error": "线程SSH连接失败", "operation": operation}
+                    
+                    # 执行操作
+                    if operation_type == "move":
+                        cmd = f"mv '{source_path}' '{target_path}'"
+                    else:
+                        cmd = f"cp '{source_path}' '{target_path}'"
+                    
+                    stdout, stderr, exit_code = self.execute_ssh_command(cmd)
+                    
+                    if exit_code == 0:
+                        return {"success": True, "operation": operation}
+                    else:
+                        return {"success": False, "error": stderr, "operation": operation}
+                        
+                except Exception as e:
+                    return {"success": False, "error": str(e), "operation": operation}
+            
+            # 使用线程池并行执行
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有任务
+                future_to_operation = {executor.submit(execute_single_operation, op): op for op in operations}
+                
+                # 收集结果
+                for future in as_completed(future_to_operation):
+                    result = future.result()
+                    
+                    with results_lock:
+                        results.append(result)
+                        if not result["success"]:
+                            failed_operations.append(result["operation"])
+            
+            # 统计结果
+            success_count = sum(1 for r in results if r["success"])
+            total_count = len(operations)
+            
+            if len(failed_operations) == 0:
+                return {
+                    "success": True,
+                    "operations_count": total_count,
+                    "success_count": success_count,
+                    "method": "parallel"
+                }
+            else:
+                # 如果是移动操作且有失败，需要回滚成功的操作
+                if operation_type == "move" and success_count > 0:
+                    self._rollback_successful_moves(results)
+                
+                return {
+                    "success": False,
+                    "error": f"并行操作部分失败，成功: {success_count}/{total_count}",
+                    "operations_count": total_count,
+                    "success_count": success_count,
+                    "failed_operations": failed_operations,
+                    "method": "parallel"
+                }
+                
+        except Exception as e:
+            return {"success": False, "error": f"并行操作异常: {str(e)}"}
+    
+    def _rollback_successful_moves(self, results):
+        """回滚成功的移动操作"""
+        try:
+            for result in results:
+                if result["success"] and "operation" in result:
+                    source_path, target_path, file_type = result["operation"]
+                    # 回滚：将目标文件移回源位置
+                    rollback_cmd = f"mv '{target_path}' '{source_path}'"
+                    self.execute_ssh_command(rollback_cmd)
+        except Exception as e:
+             print(f"回滚操作失败: {e}")
+    
+    def _execute_atomic_operations(self, operations, operation_type="copy", max_workers=4):
+        """原子性执行SSH操作，保证事务性和数据一致性
+        
+        Args:
+            operations: 操作列表
+            operation_type: 操作类型
+            max_workers: 最大并行工作线程数
+            
+        Returns:
+            dict: 操作结果
+        """
+        import uuid
+        import time
+        
+        try:
+            ssh_client = self.get_ssh_client()
+            if not ssh_client:
+                return {"success": False, "error": "无法建立SSH连接"}
+            
+            # 生成事务ID
+            transaction_id = str(uuid.uuid4())[:8]
+            temp_dir = f"/tmp/atomic_transaction_{transaction_id}"
+            
+            # 第一阶段：预检查和准备
+            print(f"开始原子性操作事务: {transaction_id}")
+            
+            # 创建临时目录用于事务管理
+            create_temp_cmd = f"mkdir -p '{temp_dir}'"
+            stdout, stderr, exit_code = self.execute_ssh_command(create_temp_cmd)
+            if exit_code != 0:
+                return {"success": False, "error": f"创建事务临时目录失败: {stderr}"}
+            
+            # 预检查所有源文件是否存在
+            missing_files = []
+            for source_path, target_path, file_type in operations:
+                check_cmd = f"test -f '{source_path}'"
+                stdout, stderr, exit_code = self.execute_ssh_command(check_cmd)
+                if exit_code != 0:
+                    missing_files.append(source_path)
+            
+            if missing_files:
+                # 清理临时目录
+                self.execute_ssh_command(f"rm -rf '{temp_dir}'")
+                return {
+                    "success": False,
+                    "error": f"源文件不存在: {', '.join(missing_files[:5])}{'...' if len(missing_files) > 5 else ''}"
+                }
+            
+            # 第二阶段：执行操作到临时位置
+            temp_operations = []
+            for i, (source_path, target_path, file_type) in enumerate(operations):
+                temp_target = f"{temp_dir}/file_{i}_{file_type}"
+                temp_operations.append((source_path, temp_target, target_path, file_type))
+            
+            # 先复制所有文件到临时位置
+            failed_temp_ops = []
+            for source_path, temp_target, final_target, file_type in temp_operations:
+                copy_cmd = f"cp '{source_path}' '{temp_target}'"
+                stdout, stderr, exit_code = self.execute_ssh_command(copy_cmd)
+                if exit_code != 0:
+                    failed_temp_ops.append((source_path, stderr))
+            
+            if failed_temp_ops:
+                # 清理临时目录
+                self.execute_ssh_command(f"rm -rf '{temp_dir}'")
+                return {
+                    "success": False,
+                    "error": f"临时复制失败: {failed_temp_ops[0][1]}",
+                    "failed_count": len(failed_temp_ops)
+                }
+            
+            # 第三阶段：原子性提交
+            commit_script_path = f"{temp_dir}/commit.sh"
+            rollback_script_path = f"{temp_dir}/rollback.sh"
+            
+            # 构建提交脚本
+            commit_lines = ["#!/bin/bash", "set -e"]
+            rollback_lines = ["#!/bin/bash", "set -e"]
+            
+            for source_path, temp_target, final_target, file_type in temp_operations:
+                # 提交：将临时文件移动到最终位置
+                commit_lines.append(f"mv '{temp_target}' '{final_target}'")
+                
+                # 回滚脚本：如果是移动操作，需要能够恢复
+                if operation_type == "move":
+                    rollback_lines.append(f"mv '{final_target}' '{source_path}'")
+                else:
+                    rollback_lines.append(f"rm -f '{final_target}'")
+            
+            # 如果是移动操作，在提交脚本中删除源文件
+            if operation_type == "move":
+                for source_path, temp_target, final_target, file_type in temp_operations:
+                    commit_lines.append(f"rm -f '{source_path}'")
+            
+            # 使用SFTP上传脚本，避免参数列表过长问题
+            commit_content = "\n".join(commit_lines)
+            rollback_content = "\n".join(rollback_lines)
+            
+            try:
+                sftp = ssh_client.open_sftp()
+                
+                # 上传提交脚本
+                with sftp.open(commit_script_path, 'w') as f:
+                    f.write(commit_content)
+                
+                # 上传回滚脚本
+                with sftp.open(rollback_script_path, 'w') as f:
+                    f.write(rollback_content)
+                
+                sftp.close()
+                print(f"原子性操作脚本上传成功: {commit_script_path}")
+                
+            except Exception as e:
+                self.execute_ssh_command(f"rm -rf '{temp_dir}'")
+                return {"success": False, "error": f"SFTP脚本上传失败: {str(e)}"}
+            
+            # 设置脚本权限
+            chmod_cmd = f"chmod +x '{commit_script_path}' '{rollback_script_path}'"
+            self.execute_ssh_command(chmod_cmd)
+            
+            # 执行提交
+            commit_cmd = f"bash '{commit_script_path}'"
+            stdout, stderr, exit_code = self.execute_ssh_command(commit_cmd)
+            
+            if exit_code == 0:
+                # 成功：清理临时目录
+                self.execute_ssh_command(f"rm -rf '{temp_dir}'")
+                return {
+                    "success": True,
+                    "operations_count": len(operations),
+                    "transaction_id": transaction_id,
+                    "method": "atomic"
+                }
+            else:
+                # 失败：执行回滚
+                print(f"提交失败，执行回滚: {stderr}")
+                rollback_cmd = f"bash '{rollback_script_path}'"
+                self.execute_ssh_command(rollback_cmd)
+                
+                # 清理临时目录
+                self.execute_ssh_command(f"rm -rf '{temp_dir}'")
+                
+                return {
+                    "success": False,
+                    "error": f"原子性操作失败并已回滚: {stderr}",
+                    "transaction_id": transaction_id,
+                    "operations_count": len(operations)
+                }
+                
+        except Exception as e:
+            # 异常情况：尝试清理
+            try:
+                if 'temp_dir' in locals():
+                    self.execute_ssh_command(f"rm -rf '{temp_dir}'")
+            except:
+                pass
+            return {"success": False, "error": f"原子性操作异常: {str(e)}"}
+    
+    def execute_rsync_operation(self, source_files, target_dir, operation_type="copy"):
+        """使用rsync进行批量文件操作
+        
+        Args:
+            source_files: 源文件列表
+            target_dir: 目标目录
+            operation_type: 操作类型 'copy' 或 'move'
+            
+        Returns:
+            dict: 操作结果
+        """
+        try:
+            ssh_client = self.get_ssh_client()
+            if not ssh_client:
+                return {"success": False, "error": "无法建立SSH连接"}
+            
+            # 检查rsync是否可用，使用多种方式检查
+            # 首先尝试 command -v（POSIX标准）
+            check_cmd = "command -v rsync"
+            stdout, stderr, exit_code = self.execute_ssh_command(check_cmd)
+            
+            if exit_code != 0:
+                # 如果 command -v 失败，尝试 which
+                check_cmd = "which rsync"
+                stdout, stderr, exit_code = self.execute_ssh_command(check_cmd)
+                
+                if exit_code != 0:
+                    # 如果 which 也失败，尝试直接执行 rsync --version
+                    check_cmd = "rsync --version"
+                    stdout, stderr, exit_code = self.execute_ssh_command(check_cmd)
+                    
+                    if exit_code != 0:
+                        return {"success": False, "error": f"服务器上未安装rsync或rsync不可用: {stderr.strip()}"}
+            
+            self.add_operation_log(f"rsync检查成功: {stdout.strip()}")
+            
+            # 使用SFTP创建临时文件列表，避免参数列表过长问题
+            file_list_path = f"/tmp/rsync_files_{int(time.time())}.txt"
+            file_list_content = "\n".join(source_files)
+            
+            try:
+                sftp = ssh_client.open_sftp()
+                with sftp.open(file_list_path, 'w') as f:
+                    f.write(file_list_content)
+                sftp.close()
+                self.add_operation_log(f"rsync文件列表上传成功: {file_list_path}")
+            except Exception as e:
+                return {"success": False, "error": f"SFTP文件列表上传失败: {str(e)}"}
+            
+            # 构建rsync命令
+            rsync_options = "-av --files-from='{}'".format(file_list_path)
+            if operation_type == "move":
+                rsync_options += " --remove-source-files"
+            
+            # 执行rsync操作
+            rsync_cmd = f"rsync {rsync_options} / '{target_dir}'"
+            stdout, stderr, exit_code = self.execute_ssh_command(rsync_cmd)
+            
+            # 清理临时文件
+            cleanup_cmd = f"rm -f '{file_list_path}'"
+            self.execute_ssh_command(cleanup_cmd)
+            
+            if exit_code == 0:
+                return {
+                    "success": True,
+                    "files_count": len(source_files),
+                    "stdout": stdout
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"rsync操作失败: {stderr}",
+                    "files_count": len(source_files)
+                }
+                
+        except Exception as e:
+            return {"success": False, "error": f"rsync操作异常: {str(e)}"}
+    
+    def execute_rsync_batch_operations(self, operations, operation_type="copy"):
+        """使用rsync执行批量文件操作（高性能优化版）
+        
+        Args:
+            operations: 操作列表 [(src, dst, ftype), ...]
+            operation_type: 操作类型 (copy/move)
+            
+        Returns:
+            dict: 操作结果
+        """
+        try:
+            ssh_client = self.get_ssh_client()
+            if not ssh_client:
+                return {"success": False, "error": "无法建立SSH连接"}
+            
+            # 检查rsync是否可用
+            check_cmd = "command -v rsync || which rsync || rsync --version"
+            stdout, stderr, exit_code = self.execute_ssh_command(check_cmd)
+            
+            if exit_code != 0:
+                return {"success": False, "error": f"服务器上未安装rsync或rsync不可用: {stderr.strip()}"}
+            
+            self.add_operation_log("rsync检查成功")
+            
+            # 按目标目录分组操作
+            target_groups = {}
+            for src, dst, ftype in operations:
+                target_dir = os.path.dirname(dst)
+                if target_dir not in target_groups:
+                    target_groups[target_dir] = []
+                target_groups[target_dir].append((src, dst, ftype))
+            
+            # 并行处理多个目标目录
+            import threading
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            total_files = 0
+            failed_dirs = []
+            
+            def process_target_dir(target_dir, group_operations):
+                """处理单个目标目录的rsync操作"""
+                try:
+                    # 确保目标目录存在
+                    mkdir_cmd = f"mkdir -p '{target_dir}'"
+                    self.execute_ssh_command(mkdir_cmd)
+                    
+                    # 使用更高效的rsync方式：直接构建源文件列表
+                    source_files = [src for src, dst, ftype in group_operations]
+                    
+                    # 创建临时文件列表（只包含源文件路径）
+                    timestamp = int(time.time())
+                    dir_hash = hash(target_dir) % 10000
+                    file_list = f"/tmp/rsync_files_{timestamp}_{dir_hash}.txt"
+                    
+                    # 上传文件列表
+                    sftp = ssh_client.open_sftp()
+                    with sftp.open(file_list, 'w') as f:
+                        f.write("\n".join(source_files))
+                    sftp.close()
+                    
+                    # 使用高性能rsync参数：
+                    # -a: 归档模式（保持权限、时间戳等）
+                    # -v: 详细输出
+                    # --files-from: 从文件读取源文件列表
+                    # --no-relative: 不保持相对路径结构
+                    # --progress: 显示进度（可选）
+                    # -W: 整文件传输（对于局域网更快）
+                    # --inplace: 就地更新（减少磁盘I/O）
+                    rsync_cmd = f"rsync -avW --inplace --files-from='{file_list}' / '{target_dir}/'"
+                    
+                    stdout, stderr, exit_code = self.execute_ssh_command(rsync_cmd)
+                    
+                    # 清理临时文件
+                    cleanup_cmd = f"rm -f '{file_list}'"
+                    self.execute_ssh_command(cleanup_cmd)
+                    
+                    if exit_code == 0:
+                        self.add_operation_log(f"rsync完成目标目录 {target_dir}: {len(group_operations)} 个文件")
+                        return {"success": True, "files_count": len(group_operations), "target_dir": target_dir}
+                    else:
+                        return {"success": False, "error": stderr, "target_dir": target_dir, "files_count": len(group_operations)}
+                        
+                except Exception as e:
+                    return {"success": False, "error": str(e), "target_dir": target_dir, "files_count": len(group_operations)}
+            
+            # 使用线程池并行处理目标目录（最多4个并发）
+            max_workers = min(4, len(target_groups))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有任务
+                future_to_dir = {
+                    executor.submit(process_target_dir, target_dir, group_operations): target_dir
+                    for target_dir, group_operations in target_groups.items()
+                }
+                
+                # 收集结果
+                for future in as_completed(future_to_dir):
+                    result = future.result()
+                    if result["success"]:
+                        total_files += result["files_count"]
+                    else:
+                        failed_dirs.append(f"{result['target_dir']}: {result['error']}")
+            
+            if failed_dirs:
+                return {
+                    "success": False,
+                    "error": f"部分目录rsync失败: {'; '.join(failed_dirs)}",
+                    "files_count": total_files
+                }
+            
+            return {
+                "success": True,
+                "files_count": total_files,
+                "stdout": f"rsync并行批量操作完成，共处理 {total_files} 个文件到 {len(target_groups)} 个目录"
+            }
+                
+        except Exception as e:
+            return {"success": False, "error": f"rsync批量操作异常: {str(e)}"}
+    
+    def process_images_worker_ssh(self, selected_images, selected_targets, images_path, labels_path, copy):
+        """SSH服务器模式的图片处理工作线程（优化版本）"""
+        operation = "复制" if copy else "移动"
+        total_operations = 0
+        failed_operations = []
+        
+        try:
+            # 获取SSH客户端
+            ssh_client = self.get_ssh_client()
+            if not ssh_client:
+                return {
+                    "success": False,
+                    "error": "无法建立SSH连接",
+                    "operation": operation
+                }
+            
+            # 更新进度
+            self.root.after(0, lambda: self.progress_dialog.update_overall_progress(0, len(selected_images) * len(selected_targets), "准备批量操作..."))
+            
+            # 转换路径为Linux格式
+            linux_images_path = self.convert_windows_to_linux_path(images_path)
+            linux_labels_path = self.convert_windows_to_linux_path(labels_path) if labels_path else None
+            
+            # 批量创建所有需要的目录（去重优化）
+            directories_to_create = set()
+            target_paths_map = {}
+            
+            for target_name, target_path in selected_targets:
+                linux_target_path = self.convert_windows_to_linux_path(target_path)
+                target_images_path = f"{linux_target_path}/images"
+                target_labels_path = f"{linux_target_path}/labels"
+                
+                directories_to_create.add(target_images_path)
+                directories_to_create.add(target_labels_path)
+                target_paths_map[target_name] = (target_images_path, target_labels_path)
+            
+            # 创建目录
+            self.root.after(0, lambda: self.progress_dialog.update_overall_progress(0, len(selected_images) * len(selected_targets), "创建远程目录结构..."))
+            for directory in directories_to_create:
+                if not self.create_ssh_directory(directory):
+                    failed_operations.append(f"创建目录失败: {directory}")
+            
+            # 准备批量操作列表
+            batch_operations = []
+            
+            # 为每个目标目录准备操作
+            for target_index, (target_name, target_path) in enumerate(selected_targets):
+                target_images_path, target_labels_path = target_paths_map[target_name]
+                
+                # 准备图片文件操作
+                for img_index, image_path in enumerate(selected_images):
+                    if self.task_cancelled or (self.progress_dialog and self.progress_dialog.is_cancelled()):
+                        self.close_ssh_connection()
+                        return {"cancelled": True}
+                    
+                    # 获取文件名（不包含路径）
+                    image_name = os.path.basename(image_path)
+                    
+                    # 构建源文件的完整Linux路径（从数据集的images目录）
+                    source_image_file = f"{linux_images_path}/{image_name}"
+                    target_image_file = f"{target_images_path}/{image_name}"
+                    
+                    # 添加图片操作到批量列表
+                    if copy or target_index < len(selected_targets) - 1:
+                        # 复制操作或不是最后一个目标
+                        batch_operations.append((source_image_file, target_image_file, "image"))
+                    else:
+                        # 移动操作且是最后一个目标
+                        batch_operations.append((source_image_file, target_image_file, "image_move"))
+                    
+                    # 查找对应的label文件
+                    if linux_labels_path:
+                        base_name = os.path.splitext(image_name)[0]
+                        for ext in ['.txt', '.xml', '.json']:
+                            label_name = base_name + ext
+                            # 构建源标签文件的完整Linux路径（从数据集的labels目录）
+                            source_label_file = f"{linux_labels_path}/{label_name}"
+                            
+                            # 检查Linux服务器上是否存在该标签文件
+                            check_cmd = f"test -f '{source_label_file}'"
+                            _, _, exit_code = self.execute_ssh_command(check_cmd)
+                            
+                            if exit_code == 0:  # 文件存在
+                                target_label_file = f"{target_labels_path}/{label_name}"
+                                
+                                # 添加标签操作到批量列表
+                                if copy or target_index < len(selected_targets) - 1:
+                                    batch_operations.append((source_label_file, target_label_file, "label"))
+                                else:
+                                    batch_operations.append((source_label_file, target_label_file, "label_move"))
+                                break
+            
+            # 分离复制和移动操作
+            copy_operations = [(src, dst, ftype) for src, dst, ftype in batch_operations if not ftype.endswith('_move')]
+            move_operations = [(src, dst, ftype.replace('_move', '')) for src, dst, ftype in batch_operations if ftype.endswith('_move')]
+            
+            # 执行批量复制操作
+            if copy_operations:
+                self.root.after(0, lambda: self.progress_dialog.update_overall_progress(0, len(selected_images) * len(selected_targets), f"批量复制 {len(copy_operations)} 个文件..."))
+                
+                # 尝试使用rsync，如果失败则使用批量脚本
+                # rsync需要按目标目录分组处理
+                rsync_result = self.execute_rsync_batch_operations(copy_operations, "copy")
+                
+                if not rsync_result["success"]:
+                    # rsync失败，使用批量脚本
+                    self.root.after(0, lambda: self.progress_dialog.add_task_log(f"rsync不可用，使用批量脚本: {rsync_result['error']}"))
+                    batch_result = self.execute_batch_ssh_operations(copy_operations, "copy")
+                    
+                    if not batch_result["success"]:
+                        failed_operations.append(f"批量复制失败: {batch_result['error']}")
+                    else:
+                        total_operations += batch_result["operations_count"]
+                        self.root.after(0, lambda: self.progress_dialog.add_task_log(f"批量复制完成: {batch_result['operations_count']} 个文件"))
+                else:
+                    total_operations += rsync_result["files_count"]
+                    self.root.after(0, lambda: self.progress_dialog.add_task_log(f"rsync复制完成: {rsync_result['files_count']} 个文件"))
+            
+            # 执行批量移动操作
+            if move_operations:
+                self.root.after(0, lambda: self.progress_dialog.update_overall_progress(0, len(selected_images) * len(selected_targets), f"批量移动 {len(move_operations)} 个文件..."))
+                
+                # 移动操作使用批量脚本（支持回滚）
+                batch_result = self.execute_batch_ssh_operations(move_operations, "move")
+                
+                if not batch_result["success"]:
+                    failed_operations.append(f"批量移动失败: {batch_result['error']}")
+                else:
+                    total_operations += batch_result["operations_count"]
+                    self.root.after(0, lambda: self.progress_dialog.add_task_log(f"批量移动完成: {batch_result['operations_count']} 个文件"))
+            
+            # 关闭SSH连接
+            self.close_ssh_connection()
+            
+            return {
+                "success": True,
+                "total_operations": total_operations,
+                "failed_operations": failed_operations,
+                "operation": operation,
+                "selected_images": selected_images,
+                "selected_targets": selected_targets,
+                "copy": copy,
+                "batch_optimized": True
+            }
+            
+
+            
+        except Exception as e:
+            self.close_ssh_connection()
             return {
                 "success": False,
                 "error": str(e),
